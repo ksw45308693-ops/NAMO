@@ -153,6 +153,7 @@ input:disabled, select:disabled, button:disabled { cursor: not-allowed; opacity:
 .table-title h2, .panel-heading h2 { margin: 0; }
 .table-title h2 strong { color: var(--cyan); }
 .pagination { display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; gap: 12px; padding: 14px 17px; border-top: 1px solid var(--border); }
+.pagination > :first-child { justify-self: start; }
 .pagination > :last-child { justify-self: end; }
 .table-title > span, .panel-heading > span { color: var(--muted); font-size: .73rem; }
 .table-scroll { overflow-x: auto; }
