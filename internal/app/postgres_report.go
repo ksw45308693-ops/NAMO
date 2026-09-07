@@ -521,7 +521,7 @@ WHERE tenant_id=$1::uuid AND id=$2::uuid AND status = 'generating' AND claim_tok
   FOR UPDATE
 ), completed_window AS (
   UPDATE public.digest_windows w
-  SET status='completed',completed_at=COALESCE(w.completed_at,$6)
+  SET status='completed',completed_at=COALESCE(w.completed_at,$5)
   FROM target_window target
   WHERE target.status = 'pending'
     AND w.tenant_id=target.tenant_id AND w.schedule_id=target.schedule_id
@@ -538,7 +538,7 @@ WHERE tenant_id=$1::uuid AND id=$2::uuid AND status = 'generating' AND claim_tok
   WHERE tenant_id=$1::uuid AND id=$2::uuid
   RETURNING id
 )
-SELECT 1 FROM advanced_schedule`, work.TenantID, work.ScheduleID, work.DueAt, work.WindowEnd, work.ReportID, generatedAt)
+SELECT 1 FROM advanced_schedule`, work.TenantID, work.ScheduleID, work.DueAt, work.WindowEnd, generatedAt)
 	if err != nil {
 		return fmt.Errorf("complete scheduled report window: %w", err)
 	}

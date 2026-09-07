@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -289,6 +290,16 @@ func TestPostgresReportFinalizeFencesSuccessAndFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	joined := strings.Join(success.execs, "\n")
+	// Every bound argument must occur in the SQL. An unused parameter between
+	// $4 and $6 leaves PostgreSQL unable to infer its type in prepared queries.
+	for i, query := range success.execs {
+		for j := range success.execArgs[i] {
+			parameter := regexp.MustCompile(fmt.Sprintf(`\$%d\b`, j+1))
+			if !parameter.MatchString(query) {
+				t.Fatalf("finalize query %d has unused parameter $%d", i+1, j+1)
+			}
+		}
+	}
 	for _, want := range []string{"claim_token = $", "attempts = $", "status = 'generating'", "status = 'generated'", "UPDATE public.digest_windows", "UPDATE public.schedules", "last_success_at"} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("success finalize missing %q: %s", want, joined)
