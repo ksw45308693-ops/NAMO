@@ -30,7 +30,7 @@ func TestAPIKeyStorePersistsAndReloadsWithoutExposingInvalidInput(t *testing.T) 
 			t.Fatalf("fresh saved key not used: %v", err)
 		}
 	}
-	for _, invalid := range []string{"", "secret%2Bencoded", "two words", "key\nline", strings.Repeat("a", 4097)} {
+	for _, invalid := range []string{"", "secret%GGencoded", "%", "key%2", "key%252B", "key%20space", "key%00null", "key%0Aline", "two words", "key\nline", strings.Repeat("a", 4097)} {
 		if err := store.Save(invalid); err == nil || (invalid != "" && strings.Contains(err.Error(), invalid)) {
 			t.Fatal("invalid input accepted or exposed")
 		}
@@ -44,11 +44,41 @@ func TestAPIKeyStorePersistsAndReloadsWithoutExposingInvalidInput(t *testing.T) 
 			t.Fatal("key file must be owner-only")
 		}
 	}
-	if err := os.WriteFile(store.Path, []byte("corrupt%2Bsecret"), 0600); err != nil {
+	if err := os.WriteFile(store.Path, []byte("corrupt%GGsecret"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.Read(); err == nil || strings.Contains(err.Error(), "corrupt") {
 		t.Fatal("corrupt file silently fell back or leaked")
+	}
+}
+
+func TestAPIKeyStoreAcceptsBothPortalFormatsAndPreservesPlus(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	for _, tt := range []struct{ name, input, want string }{
+		{"decoded", "test+key/abc==", "test+key/abc=="},
+		{"encoded", "test%2Bkey%2Fabc%3D%3D", "test+key/abc=="},
+		{"lowercase", "test%2bkey%2fabc%3d%3d", "test+key/abc=="},
+		{"mixed", "test+key%2Fabc%3D=", "test+key/abc=="},
+		{"trimmed", " \r\ntest%2Bkey%3D\r\n", "test+key="},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			store := APIKeyStore{Path: filepath.Join(dir, tt.name)}
+			if err := store.Save(tt.input); err != nil {
+				t.Fatalf("portal key rejected: %v", err)
+			}
+			if raw, err := os.ReadFile(store.Path); err != nil || string(raw) != tt.want {
+				t.Fatal("did not persist canonical decoded key")
+			}
+			if key, err := store.Read(); err != nil || key != tt.want {
+				t.Fatalf("stored key changed on reload: %v", err)
+			}
+			if key, err := (APIKeyStore{Fallback: tt.input}).Read(); err != nil || key != tt.want {
+				t.Fatalf("environment key not normalized: %v", err)
+			}
+		})
 	}
 }
 

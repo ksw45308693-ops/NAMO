@@ -3,12 +3,16 @@ package app
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"namo/internal/config"
+	"namo/internal/model"
+	"namo/internal/procurement"
 	appweb "namo/internal/web"
 )
 
@@ -26,7 +30,7 @@ func TestCollectionReadsCurrentKeyBeforeStartingWork(t *testing.T) {
 	if _, err := run(context.Background()); !errors.Is(err, config.ErrAPIKeyNotConfigured) || len(seen) != 0 {
 		t.Fatal("missing key started collection")
 	}
-	for _, key := range []string{"key-one", "key-two"} {
+	for _, key := range []string{"key-one", "key%2Btwo%2F%3D"} {
 		if err := cfg.APIKeys().Save(key); err != nil {
 			t.Fatal(err)
 		}
@@ -34,7 +38,7 @@ func TestCollectionReadsCurrentKeyBeforeStartingWork(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if len(seen) != 2 || seen[0] != "key-one" || seen[1] != "key-two" {
+	if len(seen) != 2 || seen[0] != "key-one" || seen[1] != "key+two/=" {
 		t.Fatal("runner cached stale key")
 	}
 	if cfg.G2BAPIKey != "" {
@@ -52,6 +56,31 @@ func TestSchedulerWaitsForAPIKeyWithoutStoppingReports(t *testing.T) {
 	}
 	if reports != 1 {
 		t.Fatal("missing API key stopped report job")
+	}
+}
+
+func TestCollectionSendsEncodedPortalKeyExactlyOnce(t *testing.T) {
+	requests := make(chan string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests <- r.URL.Query().Get("serviceKey")
+		_, _ = w.Write([]byte(`{"response":{"header":{"resultCode":"00","resultMsg":"OK"},"body":{"items":[],"totalCount":0,"numOfRows":100,"pageNo":1}}}`))
+	}))
+	defer server.Close()
+	run := collectionWithAPIKey(config.Config{G2BAPIKey: "test+key%2F%3D"}, func(ctx context.Context, cfg config.Config) (CollectionResult, error) {
+		client := procurement.NewClient(procurement.Config{BaseURL: server.URL, HTTPClient: server.Client(), ServiceKey: cfg.G2BAPIKey})
+		_, err := client.List(ctx, model.CategoryConstruction, procurement.ListQuery{})
+		return CollectionResult{}, err
+	})
+	if _, err := run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case key := <-requests:
+		if key != "test+key/=" {
+			t.Fatal("API received a double-encoded key or a lost plus")
+		}
+	default:
+		t.Fatal("collection did not reach API")
 	}
 }
 

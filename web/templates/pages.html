@@ -266,10 +266,10 @@
     </div>
     <form method="post" action="/settings/g2b-api-key" class="compact-form api-key-form">
       {{if .AdminWritable}}<input type="hidden" name="_csrf" value="{{.CSRFToken}}">{{end}}
-      <label for="g2b-api-key">Decoding 인증키
+      <label for="g2b-api-key">나라장터 인증키
       <input id="g2b-api-key" name="api_key" type="password" autocomplete="new-password" spellcheck="false" maxlength="4096" required aria-describedby="g2b-key-note" {{if not .AdminWritable}}disabled{{end}}></label>
       <button class="button button-primary" type="submit" {{if not .AdminWritable}}disabled{{end}}>API 키 저장</button>
-      <p class="integration-note" id="g2b-key-note">공공데이터포털의 Decoding 인증키를 붙여넣으세요. 빈 값은 저장되지 않습니다. 저장 후 플랫폼 관리에서 수집 1회 실행으로 확인하세요.</p>
+      <p class="integration-note" id="g2b-key-note">공공데이터포털의 Encoding 또는 Decoding 인증키를 그대로 붙여넣으세요. Encoding 키는 자동 변환합니다. 저장 후 플랫폼 관리에서 수집 1회 실행으로 확인하세요.</p>
     </form>
   </section>
   {{end}}

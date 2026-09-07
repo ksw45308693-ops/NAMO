@@ -3,7 +3,6 @@ package web
 import (
 	"errors"
 	"net/http"
-	"strings"
 
 	"namo/internal/config"
 )
@@ -41,8 +40,8 @@ func (h *Handler) handleSaveAPIKey(w http.ResponseWriter, r *http.Request, ident
 		http.Error(w, "요청을 확인할 수 없습니다.", http.StatusForbidden)
 		return
 	}
-	key := strings.TrimSpace(r.PostForm.Get("api_key"))
-	if err := config.ValidateAPIKey(key); err != nil {
+	key, err := config.NormalizeAPIKey(r.PostForm.Get("api_key"))
+	if err != nil {
 		http.Error(w, config.ErrInvalidAPIKey.Error(), http.StatusBadRequest)
 		return
 	}

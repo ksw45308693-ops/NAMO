@@ -39,7 +39,7 @@ func TestAPIKeyFormPersistsSecretWithAdminAndCSRFGuards(t *testing.T) {
 		{"platform_admin", "", "POST", form, 403},
 		{"platform_admin", "admin", "GET", "", 405},
 		{"platform_admin", "admin", "POST", "api_key=new-secret", 403},
-		{"platform_admin", "admin", "POST", "_csrf=token-123&api_key=bad%252Bsecret", 400},
+		{"platform_admin", "admin", "POST", "_csrf=token-123&api_key=bad%25GGsecret", 400},
 		{"platform_admin", "admin", "POST", "_csrf=token-123&api_key=" + strings.Repeat("a", 20000), 413},
 		{"platform_admin", "admin", "POST", form, 303},
 	} {
@@ -54,6 +54,26 @@ func TestAPIKeyFormPersistsSecretWithAdminAndCSRFGuards(t *testing.T) {
 	}
 	if key, err := store.Read(); err != nil || key != "new+/=secret" {
 		t.Fatal("form did not persist decoded key")
+	}
+	for _, input := range []string{"new%2B%2F%3Dsecret", "new+%2F%3Dsecret"} {
+		body := url.Values{"_csrf": {"token-123"}, "api_key": {input}}.Encode()
+		response := serveHandler(t, handler, "POST", "/settings/g2b-api-key", body)
+		if response.Code != 303 {
+			t.Fatalf("encoded portal key rejected: %d", response.Code)
+		}
+		if key, err := store.Read(); err != nil || key != "new+/=secret" {
+			t.Fatal("encoded key was changed or decoded twice")
+		}
+	}
+	for _, invalid := range []string{"bad%252Bsecret", "bad%20secret", "bad%secret"} {
+		body := url.Values{"_csrf": {"token-123"}, "api_key": {invalid}}.Encode()
+		response := serveHandler(t, handler, "POST", "/settings/g2b-api-key", body)
+		if response.Code != 400 || strings.Contains(response.Body.String(), "secret") {
+			t.Fatal("invalid key accepted or reflected")
+		}
+		if key, _ := store.Read(); key != "new+/=secret" {
+			t.Fatal("invalid replacement lost previous key")
+		}
 	}
 	backend.data.Admin.APIKeyConfigured = true
 	page := serveHandler(t, handler, "GET", "/settings?result=g2b-key-saved", "")

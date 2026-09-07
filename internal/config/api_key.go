@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -10,7 +11,7 @@ import (
 )
 
 var ErrAPIKeyNotConfigured = errors.New("환경 설정에서 나라장터 API 키를 먼저 등록하세요")
-var ErrInvalidAPIKey = errors.New("공백이나 %가 없는 Decoding 인증키를 입력하세요 (최대 4096바이트)")
+var ErrInvalidAPIKey = errors.New("공공데이터포털의 Encoding 또는 Decoding 인증키를 입력하세요 (공백 없이 최대 4096바이트)")
 var errAPIKeyFile = errors.New("API 키 파일을 사용할 수 없습니다. 저장 경로와 권한을 확인하세요")
 
 // APIKeyStore keeps the secret out of page models and reloads it for each run.
@@ -35,16 +36,27 @@ func (c Config) APIKeys() APIKeyStore {
 	return APIKeyStore{Path: c.G2BAPIKeyFile, Fallback: c.G2BAPIKey}
 }
 
-func ValidateAPIKey(key string) error {
+// NormalizeAPIKey accepts either portal format and returns the decoded key.
+// PathUnescape preserves literal '+', unlike QueryUnescape. Decode only once:
+// a remaining percent escape (double encoding) fails the character check.
+func NormalizeAPIKey(key string) (string, error) {
+	key = strings.TrimSpace(key)
 	if key == "" || len(key) > 4096 {
-		return ErrInvalidAPIKey
+		return "", ErrInvalidAPIKey
+	}
+	if strings.Contains(key, "%") {
+		var err error
+		key, err = url.PathUnescape(key)
+		if err != nil {
+			return "", ErrInvalidAPIKey
+		}
 	}
 	for _, c := range key {
 		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || strings.ContainsRune("+/=_-.", c)) {
-			return ErrInvalidAPIKey
+			return "", ErrInvalidAPIKey
 		}
 	}
-	return nil
+	return key, nil
 }
 
 func (s APIKeyStore) Read() (string, error) {
@@ -64,10 +76,11 @@ func (s APIKeyStore) Read() (string, error) {
 			if readErr != nil || len(data) > 4096 {
 				return "", errAPIKeyFile
 			}
-			key = string(data)
-			if ValidateAPIKey(key) != nil {
+			key, err := NormalizeAPIKey(string(data))
+			if err != nil {
 				return "", errAPIKeyFile
 			}
+			return key, nil
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return "", errAPIKeyFile
 		}
@@ -75,15 +88,12 @@ func (s APIKeyStore) Read() (string, error) {
 	if key == "" {
 		return "", ErrAPIKeyNotConfigured
 	}
-	if err := ValidateAPIKey(key); err != nil {
-		return "", err
-	}
-	return key, nil
+	return NormalizeAPIKey(key)
 }
 
 func (s APIKeyStore) Save(key string) error {
-	key = strings.TrimSpace(key)
-	if err := ValidateAPIKey(key); err != nil {
+	key, err := NormalizeAPIKey(key)
+	if err != nil {
 		return err
 	}
 	if err := s.checkPath(); err != nil {
