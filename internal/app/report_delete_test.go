@@ -3,9 +3,12 @@ package app
 import (
 	"context"
 	"errors"
+	"io/fs"
+	"namo/internal/report"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -37,7 +40,7 @@ func TestDeleteReportLocksTenantRowAndKeepsTombstone(t *testing.T) {
 	if err != nil || removed != "tenant-a/2026/09/report/report.html" {
 		t.Fatalf("removed=%q err=%v", removed, err)
 	}
-	for _, want := range []string{"tenant_id=$1::uuid", "id=$2::uuid", "status='generated'", "FOR UPDATE"} {
+	for _, want := range []string{"tenant_id=$1::uuid", "id=$2::uuid", "status IN ('generated','failed')", "FOR UPDATE"} {
 		if !strings.Contains(stub.rowQueries[0], want) {
 			t.Errorf("lock query missing %s", want)
 		}
@@ -52,6 +55,86 @@ func TestDeleteReportLocksTenantRowAndKeepsTombstone(t *testing.T) {
 	}
 	if !strings.Contains(tenantReportsSQL, "deleted_at IS NULL") {
 		t.Fatal("deleted reports still listed")
+	}
+}
+
+func TestDeleteFailedReportWithPlaceholderAndMissingFile(t *testing.T) {
+	files, err := report.OpenFileStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer files.Close()
+	for _, hasFile := range []bool{false, true} {
+		stub := &reportStoreStub{rowResults: []reportRowFunc{func(dest ...any) error {
+			*(dest[0].(*string)) = "reports/tenant-a/" + testWebReportID + ".html"
+			*(dest[1].(*bool)) = false
+			if len(dest) > 2 {
+				*(dest[2].(*string)) = "failed"
+				*(dest[3].(*time.Time)) = time.Date(2026, 9, 7, 0, 0, 0, 0, time.UTC)
+				*(dest[4].(*string)) = "scheduled"
+			}
+			return nil
+		}}}
+		name := "tenant-a/2026/09/" + testWebReportID + "/20260907_통합보고서.html"
+		if hasFile {
+			if _, err := files.Write(context.Background(), name, []byte("orphan")); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := deleteReport(context.Background(), stub, "tenant-a", testWebReportID, files.Remove); err != nil {
+			t.Fatal(err)
+		}
+		if file, _, err := files.Open(name); !errors.Is(err, fs.ErrNotExist) {
+			if file != nil {
+				file.Close()
+			}
+			t.Fatalf("failed report artifact remains: %v", err)
+		}
+		if len(stub.execs) != 2 || strings.Contains(strings.Join(stub.queries, "\n"), "public.schedules") {
+			t.Fatal("deletion must not lock schedules or alter active delivery windows")
+		}
+	}
+}
+
+func TestScheduledDeletedReportClosesWindowWithoutReclaim(t *testing.T) {
+	stub := &reportStoreStub{rowResults: []reportRowFunc{func(dest ...any) error {
+		*(dest[0].(*bool)) = true
+		if len(dest) > 1 {
+			*(dest[1].(*bool)) = true
+		}
+		return nil
+	}}}
+	now := time.Date(2026, 9, 7, 0, 0, 0, 0, time.UTC)
+	_, claimed, err := claimScheduledReport(context.Background(), stub, "tenant-a", "tenant", reportSchedule{ID: "schedule-a"}, now, now, now)
+	if err != nil || claimed {
+		t.Fatalf("claimed=%v err=%v", claimed, err)
+	}
+	if len(stub.rowQueries) != 1 || len(stub.execs) != 1 {
+		t.Fatal("deleted report was reclaimed or its pending window was not handled")
+	}
+	for _, want := range []string{"active_lease", "NOT EXISTS (SELECT 1 FROM active_lease)", "UPDATE public.digest_windows", "UPDATE public.schedules"} {
+		if !strings.Contains(stub.execs[0], want) {
+			t.Fatalf("terminal window handling missing %s", want)
+		}
+	}
+}
+
+func TestDeletedReportCannotBeRetriedOrReclaimed(t *testing.T) {
+	for _, retry := range []bool{false, true} {
+		stub := &reportStoreStub{}
+		var claimed bool
+		var err error
+		if retry {
+			_, claimed, err = retryReport(context.Background(), stub, "tenant-a", testWebReportID, time.Now())
+		} else {
+			_, claimed, err = reclaimReport(context.Background(), stub, "tenant-a", testWebReportID)
+		}
+		if err != nil || claimed {
+			t.Fatalf("claimed=%v err=%v", claimed, err)
+		}
+		if !strings.Contains(stub.rowQueries[0], "deleted_at IS NULL") {
+			t.Fatal("deleted report can be claimed again")
+		}
 	}
 }
 

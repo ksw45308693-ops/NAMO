@@ -142,7 +142,7 @@ WHERE w.tenant_id=$1::uuid AND w.schedule_id=$2::uuid AND w.status = 'completed'
     WHERE i.tenant_id=w.tenant_id AND i.schedule_id=w.schedule_id
       AND i.due_at=w.due_at AND i.window_end_at=w.window_end_at
   )
-  AND (r.id IS NULL OR (r.attempts < 3 AND
+  AND (r.id IS NULL OR (r.deleted_at IS NULL AND r.attempts < 3 AND
     (r.status = 'failed' OR (r.status = 'generating' AND r.claimed_at < pg_catalog.clock_timestamp() - interval '15 minutes'))))
 ORDER BY w.due_at DESC
 LIMIT 1`, tenantID, schedules[index].ID).Scan(&schedules[index].PendingDue, &schedules[index].PendingWindowEnd)
@@ -166,14 +166,20 @@ WHERE tenant_id=$1::uuid AND schedule_id=$2::uuid AND status='pending'`, tenantI
 }
 
 func claimScheduledReport(ctx context.Context, tx reportStore, tenantID, tenantName string, schedule reportSchedule, dueAt, windowEnd, now time.Time) (ReportWork, bool, error) {
-	var hasItems bool
+	var hasItems, deleted bool
 	if err := tx.QueryRow(ctx, `SELECT EXISTS (
   SELECT 1 FROM public.digest_window_items
   WHERE tenant_id=$1::uuid AND schedule_id=$2::uuid AND due_at=$3 AND window_end_at=$4
-)`, tenantID, schedule.ID, dueAt, windowEnd).Scan(&hasItems); err != nil {
+), EXISTS (
+  SELECT 1 FROM public.reports
+  WHERE tenant_id=$1::uuid AND schedule_id=$2::uuid AND due_at=$3
+    AND trigger='scheduled' AND deleted_at IS NOT NULL
+)`, tenantID, schedule.ID, dueAt, windowEnd).Scan(&hasItems, &deleted); err != nil {
 		return ReportWork{}, false, fmt.Errorf("check scheduled report snapshot: %w", err)
 	}
-	if !hasItems {
+	// A deleted report keeps its window identity. Use the existing terminal
+	// window handling, which waits for active delivery leases before advancing.
+	if deleted || !hasItems {
 		if err := completeNoopDigestWindow(ctx, tx, tenantID, schedule.ID, dueAt, windowEnd); err != nil {
 			return ReportWork{}, false, err
 		}
@@ -194,7 +200,7 @@ func claimScheduledReport(ctx context.Context, tx reportStore, tenantID, tenantN
   ON CONFLICT (tenant_id,schedule_id,due_at) WHERE trigger='scheduled'
   DO UPDATE SET status = 'generating', attempts = public.reports.attempts + 1,
       claim_token = pg_catalog.gen_random_uuid(), claimed_at = EXCLUDED.claimed_at, last_error = NULL
-  WHERE public.reports.attempts < 3
+  WHERE public.reports.deleted_at IS NULL AND public.reports.attempts < 3
     AND ((public.reports.status = 'generating' AND public.reports.claimed_at < EXCLUDED.claimed_at - interval '15 minutes')
       OR public.reports.status = 'failed')
   RETURNING id,tenant_id,schedule_id,due_at,window_start_at,window_end_at,tenant_name,schedule_name,trigger,relative_path,claim_token,attempts
@@ -344,7 +350,7 @@ func reclaimReport(ctx context.Context, tx reportStore, tenantID, reportID strin
 	row := tx.QueryRow(ctx, `WITH claimed AS (
   UPDATE public.reports
   SET status = 'generating',attempts = attempts + 1,claim_token = pg_catalog.gen_random_uuid(),claimed_at=pg_catalog.clock_timestamp(),last_error=NULL
-  WHERE tenant_id=$1::uuid AND id=$2::uuid AND attempts < 3
+  WHERE tenant_id=$1::uuid AND id=$2::uuid AND deleted_at IS NULL AND attempts < 3
     AND ((status = 'generating' AND claimed_at < pg_catalog.clock_timestamp() - interval '15 minutes') OR status = 'failed')
   RETURNING *
 )
@@ -372,7 +378,7 @@ func retryReport(ctx context.Context, tx reportStore, tenantID, reportID string,
 	row := tx.QueryRow(ctx, `WITH claimed AS (
   UPDATE public.reports
   SET status = 'generating',attempts = 1,claim_token = pg_catalog.gen_random_uuid(),claimed_at=$3,last_error=NULL
-  WHERE tenant_id=$1::uuid AND id=$2::uuid AND status = 'failed'
+  WHERE tenant_id=$1::uuid AND id=$2::uuid AND deleted_at IS NULL AND status = 'failed'
   RETURNING *
 )
 SELECT c.id::text,c.tenant_id::text,c.tenant_name,COALESCE(c.schedule_id::text,''),c.schedule_name,

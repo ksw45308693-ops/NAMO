@@ -55,7 +55,7 @@ func TestDeleteReportErrorsDoNotClaimSuccess(t *testing.T) {
 	}
 }
 
-func TestReportDeleteButtonOnlyForGeneratedAndWritable(t *testing.T) {
+func TestReportDeleteButtonOnlyForTerminalAndWritable(t *testing.T) {
 	for _, role := range []string{"tenant_admin", "member", "platform_admin"} {
 		h, err := NewHandlerWithOptions(Options{Backend: &staticBackend{data: AppData{Reports: []ReportView{
 			{ID: testReportID, FileName: "20260907_데이터보고서.html", Status: "생성 완료", Downloadable: true},
@@ -74,7 +74,10 @@ func TestReportDeleteButtonOnlyForGeneratedAndWritable(t *testing.T) {
 		if want && (!strings.Contains(body, "data-confirm=") || !strings.Contains(body, "복구할 수 없습니다")) {
 			t.Fatal("missing delete confirmation")
 		}
-		if strings.Contains(body, "/reports/failed/delete") || strings.Contains(body, "/reports/pending/delete") {
+		if strings.Contains(body, "/reports/failed/delete") != want {
+			t.Fatalf("failed report delete button role=%s", role)
+		}
+		if strings.Contains(body, "/reports/pending/delete") {
 			t.Fatal("unfinished report deletion offered")
 		}
 	}

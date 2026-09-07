@@ -994,7 +994,7 @@ func (h *Handler) handleDeleteReport(w http.ResponseWriter, r *http.Request, req
 	}
 	if err := h.actions.DeleteReport(r.Context(), requestContext, reportID); err != nil {
 		if errors.Is(err, ErrReportNotFound) {
-			h.renderStatus(w, http.StatusNotFound, "삭제할 수 없는 리포트", "생성 완료된 리포트인지 확인해 주세요.")
+			h.renderStatus(w, http.StatusNotFound, "삭제할 수 없는 리포트", "생성이 완료되었거나 실패한 리포트인지 확인해 주세요.")
 			return
 		}
 		http.Error(w, "리포트를 삭제하지 못했습니다. 목록으로 돌아가 다시 시도해 주세요.", http.StatusInternalServerError)

@@ -233,6 +233,121 @@ WHERE r.tenant_id=$1::uuid AND r.id=$2::uuid`, tenantA, first.ReportID).Scan(&re
 	t.Run("delete generated reports", func(t *testing.T) {
 		testDeleteGeneratedReports(t, ctx, harness, repository, tenantA, tenantB, first, manualRetry, now)
 	})
+	t.Run("delete failed reports", func(t *testing.T) {
+		testDeleteFailedReports(t, ctx, harness, repository, tenantB, now)
+	})
+}
+
+func testDeleteFailedReports(t *testing.T, ctx context.Context, harness *releasePostgresHarness, repository *PostgresRepository, otherTenant string, now time.Time) {
+	t.Helper()
+	files, err := report.OpenFileStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer files.Close()
+	service := &WebService{Repository: repository, ReportStore: files}
+	for _, trigger := range []string{"manual", "scheduled"} {
+		t.Run(trigger, func(t *testing.T) {
+			tenantID := insertTenant(t, ctx, harness.ownerPool, "삭제 테스트")
+			insertReportMatch(t, ctx, harness, tenantID, now)
+			scheduleID := insertReportSchedule(t, ctx, harness, tenantID, "삭제 예약")
+			var work ReportWork
+			if trigger == "manual" {
+				var claimed bool
+				work, claimed, err = repository.ClaimManualReport(ctx, tenantID, now)
+				if err != nil || !claimed {
+					t.Fatalf("manual claim=%v err=%v", claimed, err)
+				}
+			} else {
+				works, err := repository.ClaimDueReports(ctx, now)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, candidate := range works {
+					if candidate.TenantID == tenantID {
+						work = candidate
+					}
+				}
+				if work.ReportID == "" {
+					t.Fatal("scheduled report not claimed")
+				}
+			}
+			if err := repository.FinalizeReportFailure(ctx, work, context.Canceled); err != nil {
+				t.Fatal(err)
+			}
+			// Attempts=1 tests resurrection guards independently of the retry cap.
+			name, err := reportRelativePath(work)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if trigger == "manual" {
+				if _, err := files.Write(ctx, name, []byte("published before finalization failed")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := service.DeleteReport(ctx, appweb.RequestContext{Role: "tenant_admin", TenantID: otherTenant}, work.ReportID); !errors.Is(err, appweb.ErrReportNotFound) {
+				t.Fatalf("cross tenant delete=%v", err)
+			}
+			rc := appweb.RequestContext{Role: "tenant_admin", TenantID: tenantID}
+			for range 2 {
+				if err := service.DeleteReport(ctx, rc, work.ReportID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if file, _, err := files.Open(name); !errors.Is(err, fs.ErrNotExist) {
+				if file != nil {
+					file.Close()
+				}
+				t.Fatalf("artifact still exists: %v", err)
+			}
+			var deleted bool
+			var items int
+			if err := harness.ownerPool.QueryRow(ctx, `SELECT deleted_at IS NOT NULL,(SELECT count(*) FROM public.report_items WHERE report_id=r.id) FROM public.reports r WHERE id=$1::uuid`, work.ReportID).Scan(&deleted, &items); err != nil {
+				t.Fatal(err)
+			}
+			if !deleted || items != 0 {
+				t.Fatalf("deleted=%v items=%d", deleted, items)
+			}
+			if _, claimed, err := repository.RetryReport(ctx, tenantID, work.ReportID, now); err != nil || claimed {
+				t.Fatalf("retry deleted report: claimed=%v err=%v", claimed, err)
+			}
+			if _, claimed, err := repository.ReclaimReport(ctx, tenantID, work.ReportID); err != nil || claimed {
+				t.Fatalf("reclaim deleted report: claimed=%v err=%v", claimed, err)
+			}
+			if trigger == "scheduled" {
+				if _, err := repository.ClaimDueReports(ctx, now); err != nil {
+					t.Fatal(err)
+				}
+				var status string
+				var lastSuccess time.Time
+				if err := harness.ownerPool.QueryRow(ctx, `SELECT w.status,s.last_success_at FROM public.digest_windows w JOIN public.schedules s ON s.tenant_id=w.tenant_id AND s.id=w.schedule_id WHERE w.tenant_id=$1::uuid AND w.schedule_id=$2::uuid AND w.due_at=$3`, tenantID, scheduleID, work.DueAt).Scan(&status, &lastSuccess); err != nil {
+					t.Fatal(err)
+				}
+				if status != "completed" || !lastSuccess.Equal(work.WindowEnd) {
+					t.Fatalf("deleted window blocks schedule: %s %v", status, lastSuccess)
+				}
+				if err := repository.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
+					_, claimed, err := claimScheduledReport(ctx, tx, tenantID, "삭제 테스트", reportSchedule{ID: scheduleID}, work.DueAt, work.WindowEnd, now)
+					if claimed {
+						t.Fatal("scheduler resurrected tombstone")
+					}
+					return err
+				}); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := repository.ClaimDueReports(ctx, now.Add(24*time.Hour)); err != nil {
+					t.Fatal(err)
+				}
+				var windows int
+				if err := harness.ownerPool.QueryRow(ctx, `SELECT count(*) FROM public.digest_windows WHERE tenant_id=$1::uuid AND schedule_id=$2::uuid`, tenantID, scheduleID).Scan(&windows); err != nil {
+					t.Fatal(err)
+				}
+				if windows < 2 {
+					t.Fatal("next scheduled window blocked by deleted failed report")
+				}
+			}
+		})
+	}
 }
 
 func testDeleteGeneratedReports(t *testing.T, ctx context.Context, harness *releasePostgresHarness, repository *PostgresRepository, tenantA, tenantB string, scheduled, manual ReportWork, now time.Time) {
