@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	ui "namo/web"
@@ -1369,15 +1370,21 @@ func validUUID(value string) bool {
 }
 
 func safeAttachmentName(name string) bool {
-	if len(name) == 0 || len(name) > 128 || !strings.HasPrefix(name, "namo-") || !strings.HasSuffix(strings.ToLower(name), ".html") {
+	if len(name) == 0 || len(name) > 255 || !utf8.ValidString(name) || !strings.HasSuffix(strings.ToLower(name), ".html") {
 		return false
 	}
-	for _, character := range []byte(name) {
-		if (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') ||
-			(character >= '0' && character <= '9') || character == '-' || character == '_' || character == '.' {
-			continue
+	if !strings.HasPrefix(name, "namo-") {
+		if len(name) <= len("20060102_보고서.html") || name[8] != '_' || !strings.HasSuffix(name, "보고서.html") {
+			return false
 		}
-		return false
+		if _, err := time.Parse("20060102", name[:8]); err != nil {
+			return false
+		}
+	}
+	for _, character := range name {
+		if unicode.IsControl(character) || strings.ContainsRune(`/\:*?"<>|`, character) {
+			return false
+		}
 	}
 	return true
 }

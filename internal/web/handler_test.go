@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"mime"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -1326,6 +1327,32 @@ func TestReportDownloadSetsAttachmentSecurityHeadersAndHonorsHEAD(t *testing.T) 
 		}
 		if actions.openReportCalls != 1 || actions.lastReportID != testReportID || actions.lastDownloadBody == nil || !actions.lastDownloadBody.closed {
 			t.Errorf("download action calls=%d id=%q closed=%v", actions.openReportCalls, actions.lastReportID, actions.lastDownloadBody != nil && actions.lastDownloadBody.closed)
+		}
+	}
+}
+
+func TestReportDownloadPreservesKoreanFilename(t *testing.T) {
+	for _, name := range []string{"20260907_데이터보고서.html", "20260907_통합보고서.html", "20260907_" + strings.Repeat("😀", 55) + "보고서.html"} {
+		actions := &recordingActions{downloadName: name, downloadBody: "<html>report</html>"}
+		response := serveHandler(t, productionHandler(t, actions), http.MethodGet, "/reports/"+testReportID+"/download", "")
+		kind, params, err := mime.ParseMediaType(response.Header().Get("Content-Disposition"))
+		if response.Code != http.StatusOK || err != nil || kind != "attachment" || params["filename"] != name {
+			t.Fatalf("status=%d disposition=%q err=%v", response.Code, response.Header().Get("Content-Disposition"), err)
+		}
+	}
+}
+
+func TestReportAttachmentRejectsUnsafeOrMalformedFilenames(t *testing.T) {
+	for _, name := range []string{
+		"", "report.html", "20261307_데이터보고서.html", "20260907_보고서.html",
+		"20260907_../데이터보고서.html", "20260907_..\\데이터보고서.html",
+		"20260907_데이터\r\n보고서.html", "20260907_데이터\x00보고서.html",
+		"20260907_데이터\x7f보고서.html", "20260907_데이터\u0085보고서.html",
+		"20260907_\xff보고서.html", "20260907_데이터:보고서.html",
+		"20260907_" + strings.Repeat("가", 100) + "보고서.html",
+	} {
+		if safeAttachmentName(name) {
+			t.Errorf("accepted unsafe attachment %q", name)
 		}
 	}
 }
