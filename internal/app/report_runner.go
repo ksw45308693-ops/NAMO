@@ -117,7 +117,11 @@ func (r ReportRunner) runClaimed(ctx context.Context, work ReportWork) (ReportOu
 		})
 		var fileResult report.FileResult
 		if operationErr == nil {
-			fileResult, operationErr = r.Writer.Write(ctx, relativePath, body)
+			operationErr = r.Repository.WithReportClaim(ctx, work, func() error {
+				var err error
+				fileResult, err = r.Writer.Write(ctx, relativePath, body)
+				return err
+			})
 			if operationErr == nil && (filepath.Clean(fileResult.RelativePath) != filepath.Clean(relativePath) || strings.TrimSpace(fileResult.SHA256) == "") {
 				operationErr = errors.New("report writer returned an invalid artifact")
 			}

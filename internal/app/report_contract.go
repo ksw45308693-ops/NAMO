@@ -21,6 +21,7 @@ type ReportRepository interface {
 	ReclaimReport(context.Context, string, string) (ReportWork, bool, error)
 	ClaimManualReport(context.Context, string, time.Time) (ReportWork, bool, error)
 	RetryReport(context.Context, string, string, time.Time) (ReportWork, bool, error)
+	WithReportClaim(context.Context, ReportWork, func() error) error
 	FinalizeReport(context.Context, ReportWork, ReportArtifact, time.Time) error
 	FinalizeReportFailure(context.Context, ReportWork, error) error
 }

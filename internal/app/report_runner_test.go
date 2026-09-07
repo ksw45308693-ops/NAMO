@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"io/fs"
 	"path"
 	"path/filepath"
 	"strings"
@@ -28,6 +29,44 @@ type reportRepositoryFake struct {
 	finalizeCalls   []ReportWork
 	finalizeErrors  []error
 	failureAttempts []int
+	publishErr      error
+}
+
+func (f *reportRepositoryFake) WithReportClaim(_ context.Context, _ ReportWork, publish func() error) error {
+	if f.publishErr != nil {
+		return f.publishErr
+	}
+	return publish()
+}
+
+func TestStaleReportWorkerCannotRecreateDeletedFile(t *testing.T) {
+	store, err := report.OpenFileStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	work := scheduledReportWork(1)
+	name, err := reportRelativePath(work)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Write(context.Background(), name, []byte("completed by replacement worker")); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Remove(context.Background(), name); err != nil {
+		t.Fatal(err)
+	}
+	repo := &reportRepositoryFake{due: []ReportWork{work}, publishErr: errors.New("claim no longer owned")}
+	_, err = (ReportRunner{Repository: repo, Writer: store}).Run(context.Background())
+	if err == nil {
+		t.Fatal("stale worker succeeded")
+	}
+	if file, _, err := store.Open(name); !errors.Is(err, fs.ErrNotExist) {
+		if file != nil {
+			file.Close()
+		}
+		t.Fatalf("stale worker recreated deleted report: %v", err)
+	}
 }
 
 func (f *reportRepositoryFake) ClaimDueReports(context.Context, time.Time) ([]ReportWork, error) {

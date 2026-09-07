@@ -346,6 +346,7 @@ type Actions interface {
 	SaveReportSchedule(context.Context, RequestContext, NotificationCommand) error
 	GenerateReport(context.Context, RequestContext) error
 	RetryReport(context.Context, RequestContext, string) error
+	DeleteReport(context.Context, RequestContext, string) error
 	OpenReport(context.Context, RequestContext, string) (ReportDownload, error)
 }
 
@@ -450,6 +451,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	downloadReportID, downloadRoute := reportRouteID(r.URL.Path, "download")
 	retryReportID, retryRoute := reportRouteID(r.URL.Path, "retry")
+	deleteReportID, deleteRoute := reportRouteID(r.URL.Path, "delete")
 	var appData AppData
 	if allows(r.Method, http.MethodGet, http.MethodHead) && !downloadRoute && r.URL.Path != "/login" && r.URL.Path != "/signup" && r.URL.Path != "/accept-invite" && r.URL.Path != "/" {
 		appData, err = h.backend.Load(r.Context(), requestContext, PageRequest{Path: r.URL.Path})
@@ -664,6 +666,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			data.ReportEmpty = true
 		case "retried":
 			data.AdminResult = "리포트 재시도를 요청했습니다."
+		case "deleted":
+			data.AdminResult = "리포트를 삭제했습니다."
 		}
 		h.render(w, "reports", data)
 	case r.URL.Path == "/reports/generate":
@@ -694,6 +698,20 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.handleRetryReport(w, r, requestContext, retryReportID)
+	case deleteRoute:
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, http.MethodPost)
+			return
+		}
+		if h.demo {
+			demoNotImplemented(w)
+			return
+		}
+		if !canMutateReport(requestContext) {
+			http.Error(w, "테넌트 관리자 권한이 필요합니다.", http.StatusForbidden)
+			return
+		}
+		h.handleDeleteReport(w, r, requestContext, deleteReportID)
 	case downloadRoute:
 		if !allows(r.Method, http.MethodGet, http.MethodHead) {
 			methodNotAllowed(w, http.MethodGet, http.MethodHead)
@@ -967,6 +985,22 @@ func (h *Handler) handleRetryReport(w http.ResponseWriter, r *http.Request, requ
 		return
 	}
 	http.Redirect(w, r, "/reports?result=retried", http.StatusSeeOther)
+}
+
+func (h *Handler) handleDeleteReport(w http.ResponseWriter, r *http.Request, requestContext RequestContext, reportID string) {
+	if !validCSRF(r, requestContext) {
+		http.Error(w, "요청을 확인할 수 없습니다.", http.StatusForbidden)
+		return
+	}
+	if err := h.actions.DeleteReport(r.Context(), requestContext, reportID); err != nil {
+		if errors.Is(err, ErrReportNotFound) {
+			h.renderStatus(w, http.StatusNotFound, "삭제할 수 없는 리포트", "생성 완료된 리포트인지 확인해 주세요.")
+			return
+		}
+		http.Error(w, "리포트를 삭제하지 못했습니다. 목록으로 돌아가 다시 시도해 주세요.", http.StatusInternalServerError)
+		return
+	}
+	http.Redirect(w, r, "/reports?result=deleted", http.StatusSeeOther)
 }
 
 func (h *Handler) handleReportDownload(w http.ResponseWriter, r *http.Request, requestContext RequestContext, reportID string) {

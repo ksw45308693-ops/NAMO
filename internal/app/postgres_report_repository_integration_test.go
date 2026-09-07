@@ -3,6 +3,8 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io/fs"
 	"os"
 	"strings"
 	"sync"
@@ -13,7 +15,9 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"namo/internal/model"
+	"namo/internal/report"
 	"namo/internal/store"
+	appweb "namo/internal/web"
 	"namo/migrations"
 )
 
@@ -225,6 +229,104 @@ WHERE r.tenant_id=$1::uuid AND r.id=$2::uuid`, tenantA, first.ReportID).Scan(&re
 	}
 	if !afterManual.Equal(lastSuccess) {
 		t.Fatalf("manual report advanced schedule from %v to %v", lastSuccess, afterManual)
+	}
+	t.Run("delete generated reports", func(t *testing.T) {
+		testDeleteGeneratedReports(t, ctx, harness, repository, tenantA, tenantB, first, manualRetry, now)
+	})
+}
+
+func testDeleteGeneratedReports(t *testing.T, ctx context.Context, harness *releasePostgresHarness, repository *PostgresRepository, tenantA, tenantB string, scheduled, manual ReportWork, now time.Time) {
+	t.Helper()
+	files, err := report.OpenFileStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer files.Close()
+	service := &WebService{Repository: repository, ReportStore: files}
+	rc := appweb.RequestContext{Role: "tenant_admin", TenantID: tenantA}
+	for _, work := range []ReportWork{scheduled, manual} {
+		name, err := reportRelativePath(work)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := files.Write(ctx, name, []byte("report")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := harness.ownerPool.Exec(ctx, `UPDATE public.reports SET relative_path=$1 WHERE id=$2::uuid`, name, work.ReportID); err != nil {
+			t.Fatal(err)
+		}
+		if err := service.DeleteReport(ctx, appweb.RequestContext{Role: "tenant_admin", TenantID: tenantB}, work.ReportID); !errors.Is(err, appweb.ErrReportNotFound) {
+			t.Fatalf("cross tenant delete=%v", err)
+		}
+		failure := errors.New("file deletion unavailable")
+		err = repository.withTenant(ctx, tenantA, func(tx pgx.Tx) error {
+			return deleteReport(ctx, tx, tenantA, work.ReportID, func(context.Context, string) error { return failure })
+		})
+		if !errors.Is(err, failure) {
+			t.Fatal(err)
+		}
+		var deleted bool
+		var items int
+		if err := harness.ownerPool.QueryRow(ctx, `SELECT deleted_at IS NOT NULL,(SELECT count(*) FROM public.report_items WHERE report_id=r.id) FROM public.reports r WHERE id=$1::uuid`, work.ReportID).Scan(&deleted, &items); err != nil {
+			t.Fatal(err)
+		}
+		if deleted || items == 0 {
+			t.Fatal("file failure did not roll back database deletion")
+		}
+		for range 2 {
+			if err := service.DeleteReport(ctx, rc, work.ReportID); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, _, err := files.Open(name); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("file remains: %v", err)
+		}
+		if err := harness.ownerPool.QueryRow(ctx, `SELECT deleted_at IS NOT NULL,(SELECT count(*) FROM public.report_items WHERE report_id=r.id) FROM public.reports r WHERE id=$1::uuid`, work.ReportID).Scan(&deleted, &items); err != nil {
+			t.Fatal(err)
+		}
+		if !deleted || items != 0 {
+			t.Fatalf("deleted=%v items=%d", deleted, items)
+		}
+		if _, err := service.OpenReport(ctx, rc, work.ReportID); !errors.Is(err, appweb.ErrReportNotFound) {
+			t.Fatalf("deleted download=%v", err)
+		}
+		if _, claimed, err := repository.RetryReport(ctx, tenantA, work.ReportID, now); err != nil || claimed {
+			t.Fatalf("deleted report retry=%v err=%v", claimed, err)
+		}
+		// A worker holding an obsolete claim must not publish after deletion.
+		if _, err := (ReportRunner{Repository: repository, Writer: files}).runClaimed(ctx, work); err == nil {
+			t.Fatal("stale worker published a deleted report")
+		}
+		if file, _, err := files.Open(name); !errors.Is(err, fs.ErrNotExist) {
+			if file != nil {
+				file.Close()
+			}
+			t.Fatalf("deleted file resurrected: %v", err)
+		}
+	}
+	works, err := repository.ClaimDueReports(ctx, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, work := range works {
+		if work.TenantID == tenantA && work.DueAt.Equal(scheduled.DueAt) {
+			t.Fatal("deleted scheduled report recreated")
+		}
+	}
+	err = repository.withTenant(ctx, tenantA, func(tx pgx.Tx) error {
+		data := appweb.AppData{}
+		if err := loadTenantReports(ctx, tx, tenantA, &data); err != nil {
+			return err
+		}
+		for _, item := range data.Reports {
+			if item.ID == scheduled.ReportID || item.ID == manual.ReportID {
+				t.Fatal("deleted report listed")
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 }
 

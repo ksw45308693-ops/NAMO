@@ -1559,6 +1559,11 @@ func (a *recordingActions) RetryReport(_ context.Context, _ RequestContext, repo
 	return a.err
 }
 
+func (a *recordingActions) DeleteReport(_ context.Context, _ RequestContext, reportID string) error {
+	a.lastReportID = reportID
+	return a.err
+}
+
 func (a *recordingActions) OpenReport(_ context.Context, _ RequestContext, reportID string) (ReportDownload, error) {
 	a.openReportCalls++
 	a.lastReportID = reportID

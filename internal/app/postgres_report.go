@@ -17,6 +17,26 @@ import (
 
 var _ ReportRepository = (*PostgresRepository)(nil)
 
+// WithReportClaim serializes file publication with reclaim and deletion. The
+// claim is checked under the same row lock deletion takes before removing files.
+func (r *PostgresRepository) WithReportClaim(ctx context.Context, work ReportWork, publish func() error) error {
+	return r.withTenant(ctx, work.TenantID, func(tx pgx.Tx) error {
+		return withReportClaim(ctx, tx, work, publish)
+	})
+}
+
+func withReportClaim(ctx context.Context, tx reportStore, work ReportWork, publish func() error) error {
+	var id string
+	err := tx.QueryRow(ctx, `SELECT id::text FROM public.reports
+WHERE tenant_id=$1::uuid AND id=$2::uuid AND claim_token=$3::uuid
+  AND status='generating' AND deleted_at IS NULL
+FOR UPDATE`, work.TenantID, work.ReportID, work.ClaimToken).Scan(&id)
+	if err != nil {
+		return fmt.Errorf("lock active report claim: %w", err)
+	}
+	return publish()
+}
+
 type reportStore interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
 	Query(context.Context, string, ...any) (pgx.Rows, error)

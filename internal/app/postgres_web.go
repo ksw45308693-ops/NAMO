@@ -191,7 +191,7 @@ WHERE tenant_id=$1::uuid AND enabled ORDER BY created_at LIMIT 1`, tenantID).Sca
 
 const tenantReportsSQL = `SELECT id::text,relative_path,trigger,status,due_at,generated_at,notice_count,attempts
 FROM public.reports
-WHERE tenant_id=$1::uuid
+WHERE tenant_id=$1::uuid AND deleted_at IS NULL
 ORDER BY due_at DESC
 LIMIT 50`
 
@@ -879,7 +879,7 @@ func reportDownloadPath(ctx context.Context, queryer reportDownloadQueryer, tena
 	var relativePath string
 	err := queryer.QueryRow(ctx, `SELECT relative_path
 FROM public.reports
-WHERE tenant_id=$1::uuid AND id=$2::uuid AND status='generated' AND relative_path<>''`, tenantID, reportID).Scan(&relativePath)
+WHERE tenant_id=$1::uuid AND id=$2::uuid AND status='generated' AND deleted_at IS NULL AND relative_path<>''`, tenantID, reportID).Scan(&relativePath)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", appweb.ErrReportNotFound
 	}

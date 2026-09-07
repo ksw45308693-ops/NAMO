@@ -179,6 +179,33 @@ func (s *FileStore) Close() error {
 	return s.root.Close()
 }
 
+// Remove deletes one regular file, never a directory or symlink. Missing files
+// are successful so a deletion can be retried after a database commit failure.
+func (s *FileStore) Remove(ctx context.Context, relativePath string) error {
+	name, err := validateRelativePath(relativePath)
+	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	info, err := s.root.Lstat(name)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect report for deletion: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return errors.New("only regular report files can be deleted")
+	}
+	if err := s.root.Remove(name); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("delete report file: %w", err)
+	}
+	s.syncParent(filepath.Dir(name))
+	return nil
+}
+
 func (s *FileStore) existingHash(ctx context.Context, path string) (string, bool, error) {
 	if err := ctx.Err(); err != nil {
 		return "", false, err
