@@ -301,17 +301,31 @@ func defaultCollectionRunnerFactory(repository *PostgresRepository, cfg config.C
 		return nil, errors.New("PostgreSQL collector repository is not available")
 	}
 	callBudget := &PostgresDailyCallBudget{DB: repository.Pool}
-	job := CollectionJob{
-		Acquire: func(ctx context.Context) (AdvisorySession, error) {
-			return repository.Pool.Acquire(ctx)
-		},
-		Run: func(ctx context.Context) (CollectionResult, error) {
-			// The region cache is per collection window. The PostgreSQL budget is
-			// shared by every process and retry for the current Seoul calendar day.
-			return runCollector(ctx, repository, cfg, callBudget)
-		},
+	return collectionWithAPIKey(cfg, func(ctx context.Context, current config.Config) (CollectionResult, error) {
+		job := CollectionJob{
+			Acquire: func(ctx context.Context) (AdvisorySession, error) {
+				return repository.Pool.Acquire(ctx)
+			},
+			Run: func(ctx context.Context) (CollectionResult, error) {
+				// The region cache is per collection window. The PostgreSQL budget is
+				// shared by every process and retry for the current Seoul calendar day.
+				return runCollector(ctx, repository, current, callBudget)
+			},
+		}
+		return job.RunLocked(ctx)
+	}), nil
+}
+
+func collectionWithAPIKey(cfg config.Config, run func(context.Context, config.Config) (CollectionResult, error)) CollectionRunner {
+	return func(ctx context.Context) (CollectionResult, error) {
+		key, err := cfg.APIKeys().Read()
+		if err != nil {
+			return CollectionResult{}, err
+		}
+		current := cfg
+		current.G2BAPIKey = key
+		return run(ctx, current)
 	}
-	return job.RunLocked, nil
 }
 
 func (r *Runtime) sendTestMail(ctx context.Context, cfg config.Config, args []string) error {
@@ -521,6 +535,9 @@ func newServeScheduler(collectionRunner CollectionRunner, reportJob ScheduledJob
 	return jobs.NewScheduler(time.Hour,
 		func(jobCtx context.Context, _ time.Time) error {
 			_, err := collectionRunner(jobCtx)
+			if errors.Is(err, config.ErrAPIKeyNotConfigured) {
+				return nil
+			}
 			return err
 		},
 		jobs.Job(reportJob),
@@ -598,9 +615,11 @@ func defaultUIFactory(ctx context.Context, repository *PostgresRepository, store
 		QueueCollection: collectionTrigger.Trigger,
 		ReportStore:     store,
 		ReportDir:       cfg.ReportDir,
+		APIKeys:         cfg.APIKeys(),
 	}
 	return webui.NewHandlerWithOptions(webui.Options{
 		Backend: service, Actions: service, MapContext: service.MapRequest,
+		SaveAPIKey: service.SaveG2BAPIKey,
 	})
 }
 

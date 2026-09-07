@@ -66,7 +66,7 @@
 <header class="page-header">
   <div>
     <h1>{{.Title}}</h1>
-    <p>{{if eq .Active "notices"}}조건에 맞은 공고와 선정 사유를 확인합니다.{{else if eq .Active "filters"}}업무에 맞는 공고만 남도록 조건을 관리합니다.{{else if eq .Active "reports"}}리포트 일정과 생성 파일을 확인합니다.{{else if eq .Active "settings"}}회사 정보와 구성원 권한을 관리합니다.{{else if eq .Active "admin"}}테넌트와 공고 수집 상태를 확인합니다.{{end}}</p>
+    <p>{{if eq .Active "notices"}}조건에 맞은 공고와 선정 사유를 확인합니다.{{else if eq .Active "filters"}}업무에 맞는 공고만 남도록 조건을 관리합니다.{{else if eq .Active "reports"}}리포트 일정과 생성 파일을 확인합니다.{{else if eq .Active "settings"}}{{if eq .Role "platform_admin"}}나라장터 API 키와 회사 정보를 관리합니다.{{else}}회사 정보와 구성원 권한을 관리합니다.{{end}}{{else if eq .Active "admin"}}테넌트와 공고 수집 상태를 확인합니다.{{end}}</p>
   </div>
 </header>
 {{end}}

@@ -89,6 +89,12 @@ namo_prestart()
 	fi
 	install -d -o "$namo_run_user" -g "$namo_run_group" -m 0750 "$REPORT_DIR"
 
+	# Provision only the fixed default path. Custom G2B_API_KEY_FILE directories
+	# must be prepared by the operator; never chown arbitrary configured parents.
+	(REPORT_DIR=/var/db/namo/secrets; namo_validate_report_dir) || return 1
+	install -d -o root -g "$namo_run_group" -m 0750 /var/db/namo || return 1
+	install -d -o "$namo_run_user" -g "$namo_run_group" -m 0700 /var/db/namo/secrets || return 1
+
 	install -o "$namo_run_user" -g "$namo_run_group" -m 0600 /dev/null "$pidfile"
 	if [ ! -e "$namo_log_file" ]; then
 		install -o "$namo_run_user" -g "$namo_run_group" -m 0600 /dev/null "$namo_log_file"

@@ -256,8 +256,23 @@
 {{define "settings"}}{{template "shell-start" .}}{{template "page-header" .}}
 {{if .Saved}}<div class="alert alert-success" role="status"><strong>환경 설정을 저장했습니다.</strong><span>회사 정보가 변경되었습니다.</span></div>{{end}}
 {{if .InviteResult}}<div class="alert alert-success" role="status"><strong>{{.InviteResult}}</strong><span>제외된 계정은 회사 데이터를 볼 수 없습니다.</span></div>{{end}}
-{{if not .Writable}}<div class="alert" id="demo-readonly-note" role="note"><strong>{{if .Demo}}읽기 전용 데모{{else}}읽기 전용{{end}}</strong><span>{{if .Demo}}회사 정보 변경은 통합 환경에서만 사용할 수 있습니다.{{else}}테넌트 관리자 권한이 필요합니다.{{end}}</span></div>{{end}}
+{{if not .Writable}}<div class="alert" id="demo-readonly-note" role="note"><strong>{{if .Demo}}읽기 전용 데모{{else if .AdminWritable}}회사 정보 읽기 전용{{else}}읽기 전용{{end}}</strong><span>{{if .Demo}}회사 정보 변경은 통합 환경에서만 사용할 수 있습니다.{{else if .AdminWritable}}나라장터 API 키는 아래에서 변경할 수 있습니다.{{else}}테넌트 관리자 권한이 필요합니다.{{end}}</span></div>{{end}}
 <div class="settings-stack">
+  {{if eq .Role "platform_admin"}}
+  <section class="settings-section" aria-labelledby="g2b-key-title">
+    <div><h2 id="g2b-key-title">나라장터 API 키</h2><p>이 NAMO 인스턴스의 전체 공고 수집에 사용하는 공통 키입니다. 플랫폼 관리자만 변경할 수 있습니다.</p>
+      <p role="status">{{if .Admin.APIKeyUnavailable}}키 확인 불가 · 서버의 저장 경로와 권한을 확인하세요.{{else if .Admin.APIKeyConfigured}}등록됨 · 저장된 키는 화면에 표시하지 않습니다.{{else}}미등록 · 키를 등록할 때까지 공고 수집을 대기합니다.{{end}}</p>
+      {{if .APIKeySaved}}<p role="status">API 키를 저장했습니다. 다음 수집부터 적용됩니다.</p>{{end}}
+    </div>
+    <form method="post" action="/settings/g2b-api-key" class="compact-form api-key-form">
+      {{if .AdminWritable}}<input type="hidden" name="_csrf" value="{{.CSRFToken}}">{{end}}
+      <label for="g2b-api-key">Decoding 인증키
+      <input id="g2b-api-key" name="api_key" type="password" autocomplete="new-password" spellcheck="false" maxlength="4096" required aria-describedby="g2b-key-note" {{if not .AdminWritable}}disabled{{end}}></label>
+      <button class="button button-primary" type="submit" {{if not .AdminWritable}}disabled{{end}}>API 키 저장</button>
+      <p class="integration-note" id="g2b-key-note">공공데이터포털의 Decoding 인증키를 붙여넣으세요. 빈 값은 저장되지 않습니다. 저장 후 플랫폼 관리에서 수집 1회 실행으로 확인하세요.</p>
+    </form>
+  </section>
+  {{end}}
   <section class="settings-section" aria-labelledby="company-title"><div><h2 id="company-title">회사 정보</h2><p>화면과 리포트에 표시할 기본 정보입니다.</p></div><form method="post" action="/settings" class="compact-form">{{if .Writable}}<input type="hidden" name="_csrf" value="{{.CSRFToken}}">{{end}}<label>회사명<input name="tenant_name" value="{{.TenantName}}" {{if not .Writable}}disabled{{end}}></label><label>대표 이메일<input name="contact_email" type="email" value="{{.ContactEmail}}" {{if not .Writable}}disabled{{end}}></label><button class="button button-primary" type="submit" {{if not .Writable}}disabled aria-describedby="demo-readonly-note"{{end}}>정보 저장</button></form></section>
   <section class="settings-section" aria-labelledby="members-title"><div><h2 id="members-title">구성원과 권한</h2><p>회사에 배정된 계정입니다. 새 구성원은 플랫폼 관리자가 배정합니다.</p></div><div class="member-table"><table><thead><tr><th scope="col">이름</th><th scope="col">이메일</th><th scope="col">역할</th><th scope="col">관리</th></tr></thead><tbody>{{range .Members}}<tr><td data-label="이름">{{.Name}}</td><td data-label="이메일">{{.Email}}</td><td data-label="역할"><span class="status-label">{{.Role}}</span></td><td data-label="관리">{{if and $.Writable .Removable}}<form method="post" action="/settings/members" data-confirm="{{.Email}} 계정을 회사에서 제외할까요? 계정은 남고 회사 데이터만 볼 수 없게 됩니다."><input type="hidden" name="_csrf" value="{{$.CSRFToken}}"><input type="hidden" name="user_id" value="{{.UserID}}"><button class="button button-danger" type="submit">회사에서 제외</button></form>{{else}}<span class="integration-note">{{if .Removable}}회사 관리자 권한 필요{{else}}본인 계정{{end}}</span>{{end}}</td></tr>{{end}}{{if not .Members}}<tr><td data-label="이름" colspan="4">배정된 구성원이 없습니다.</td></tr>{{end}}</tbody></table></div></section>
   <section class="danger-section" aria-labelledby="session-title"><div><h2 id="session-title">로그인 세션</h2><p id="session-note">세션 저장소 연동 후 다른 기기의 로그인을 종료할 수 있습니다.</p></div><button class="button button-danger" type="button" disabled aria-describedby="session-note">다른 세션 종료</button></section>

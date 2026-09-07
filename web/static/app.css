@@ -249,6 +249,8 @@ td small { display: block; margin-top: 3px; color: var(--muted); }
 .recipient-form { display: grid; grid-template-columns: 1fr 1.35fr auto; align-items: end; gap: 9px; margin-top: 12px; padding-top: 14px; border-top: 1px solid var(--border); }
 .recipient-form label { display: grid; gap: 5px; color: #4e5c6f; font-size: .78rem; font-weight: 800; }
 .compact-form { grid-template-columns: 1fr 1fr auto; align-items: end; }
+.api-key-form { grid-template-columns: minmax(0, 1fr) auto; }
+.api-key-form .integration-note { grid-column: 1 / -1; }
 .member-table table { margin-bottom: 12px; }
 .member-table th, .member-table td { padding-left: 12px; }
 .mail-preview { padding: 22px; }

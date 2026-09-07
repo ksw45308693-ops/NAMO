@@ -64,6 +64,10 @@ if ! grep -Fqx -- "-d -o custom_namo -g custom_group -m 0750 $rc_case/reports" "
 	echo "rc prestart ignored the configured report owner/group" >&2
 	exit 1
 fi
+if ! grep -Fqx -- "-d -o custom_namo -g custom_group -m 0700 /var/db/namo/secrets" "$rc_case/install.log"; then
+	echo "rc prestart did not provision an owner-only API key directory" >&2
+	exit 1
+fi
 
 cat > "$mock_bin/service" <<'EOF'
 #!/bin/sh

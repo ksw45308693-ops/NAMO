@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"namo/internal/config"
 	appweb "namo/internal/web"
 )
 
@@ -31,10 +32,10 @@ func TestAsyncCollectionTriggerReturnsImmediatelyAndOutlivesRequest(t *testing.T
 	}
 
 	requestCtx, cancelRequest := context.WithCancel(context.Background())
-	service := &WebService{QueueCollection: trigger.Trigger}
+	service := &WebService{QueueCollection: trigger.Trigger, APIKeys: config.APIKeyStore{Fallback: "test-key"}}
 	returned := make(chan error, 1)
 	go func() {
-		returned <- service.RunCollection(requestCtx, appweb.RequestContext{Role: "platform_admin"})
+		returned <- service.RunCollection(requestCtx, appweb.RequestContext{UserID: "admin", Role: "platform_admin"})
 	}()
 
 	select {

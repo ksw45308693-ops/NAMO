@@ -18,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"namo/internal/auth"
+	"namo/internal/config"
 	"namo/internal/matcher"
 	"namo/internal/model"
 	"namo/internal/report"
@@ -25,6 +26,7 @@ import (
 )
 
 type WebService struct {
+	APIKeys         config.APIKeyStore
 	Repository      *PostgresRepository
 	QueueCollection func() error
 	TestMail        func(context.Context, string) error
@@ -83,6 +85,11 @@ func (s *WebService) Load(ctx context.Context, requestContext appweb.RequestCont
 	}
 	if requestContext.Role == "platform_admin" {
 		data.Admin.ReportDir = s.ReportDir
+		if page.Path == "/settings" {
+			_, keyErr := s.APIKeys.Read()
+			data.Admin.APIKeyConfigured = keyErr == nil
+			data.Admin.APIKeyUnavailable = keyErr != nil && !errors.Is(keyErr, config.ErrAPIKeyNotConfigured)
+		}
 		if err := s.loadPlatformData(ctx, &data, state, requestContext.UserID); err != nil {
 			return appweb.AppData{}, err
 		}
@@ -956,9 +963,19 @@ func (s *WebService) SaveSettings(ctx context.Context, requestContext appweb.Req
 	})
 }
 
+func (s *WebService) SaveG2BAPIKey(_ context.Context, requestContext appweb.RequestContext, key string) error {
+	if s == nil || requestContext.Role != "platform_admin" || requestContext.UserID == "" {
+		return errors.New("platform administrator identity is required")
+	}
+	return s.APIKeys.Save(key)
+}
+
 func (s *WebService) RunCollection(_ context.Context, requestContext appweb.RequestContext) error {
-	if requestContext.Role != "platform_admin" || s.QueueCollection == nil {
+	if s == nil || requestContext.Role != "platform_admin" || requestContext.UserID == "" || s.QueueCollection == nil {
 		return errors.New("platform collection action is unavailable")
+	}
+	if _, err := s.APIKeys.Read(); err != nil {
+		return err
 	}
 	return s.QueueCollection()
 }

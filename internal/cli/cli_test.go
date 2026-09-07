@@ -113,7 +113,7 @@ func TestRunExecutesValidatedCommand(t *testing.T) {
 	}
 }
 
-func TestRunRejectsMissingCommandConfiguration(t *testing.T) {
+func TestRunResolvesCollectionKeyAtExecution(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	lookup := lookupMap(map[string]string{
 		"DATABASE_URL":           "postgres://runtime@localhost/monitor",
@@ -122,11 +122,10 @@ func TestRunRejectsMissingCommandConfiguration(t *testing.T) {
 	})
 
 	code := Run(context.Background(), []string{"collect-once"}, lookup, func(context.Context, string, config.Config, []string) error {
-		t.Fatal("executor called with invalid command configuration")
-		return nil
+		return config.ErrAPIKeyNotConfigured
 	}, &stdout, &stderr)
 
-	if code != 1 || !strings.Contains(stderr.String(), "G2B_API_KEY") {
+	if code != 1 || !strings.Contains(stderr.String(), config.ErrAPIKeyNotConfigured.Error()) {
 		t.Fatalf("Run() code = %d stderr = %q", code, stderr.String())
 	}
 }

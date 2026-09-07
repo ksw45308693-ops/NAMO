@@ -18,6 +18,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"namo/internal/config"
 	ui "namo/web"
 )
 
@@ -26,6 +27,7 @@ type pageData struct {
 	Active         string
 	State          string
 	Saved          bool
+	APIKeySaved    bool
 	Deleted        bool
 	UserName       string
 	TenantName     string
@@ -93,11 +95,13 @@ type DashboardView struct {
 
 // AdminView contains platform collection health.
 type AdminView struct {
-	Healthy        bool
-	LastCollected  string
-	CollectedCount int
-	FailedJobs     int
-	ReportDir      string
+	APIKeyConfigured  bool
+	APIKeyUnavailable bool
+	Healthy           bool
+	LastCollected     string
+	CollectedCount    int
+	FailedJobs        int
+	ReportDir         string
 }
 
 // ReportView is one tenant-visible report artifact and its generation state.
@@ -352,6 +356,7 @@ type Actions interface {
 
 // Options configures the production handler behind authentication middleware.
 type Options struct {
+	SaveAPIKey func(context.Context, RequestContext, string) error
 	Backend    Backend
 	Actions    Actions
 	Onboarding Onboarding
@@ -361,6 +366,7 @@ type Options struct {
 // Handler serves the embeddable web interface. Domain integration can replace
 // the local page models without changing template routes.
 type Handler struct {
+	saveAPIKey func(context.Context, RequestContext, string) error
 	templates  *template.Template
 	assets     http.Handler
 	backend    Backend
@@ -407,6 +413,7 @@ func newHandler(options Options, demo bool) (http.Handler, error) {
 		return nil, err
 	}
 	return &Handler{
+		saveAPIKey: options.SaveAPIKey,
 		templates:  templates,
 		assets:     http.FileServer(http.FS(assetsFS)),
 		backend:    options.Backend,
@@ -722,7 +729,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.handleReportDownload(w, r, requestContext, downloadReportID)
+	case r.URL.Path == "/settings/g2b-api-key":
+		h.handleSaveAPIKey(w, r, requestContext)
 	case r.URL.Path == "/settings":
+		w.Header().Set("Cache-Control", "no-store")
 		if r.Method == http.MethodPost {
 			if h.demo {
 				demoNotImplemented(w)
@@ -743,6 +753,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		data.Saved = !h.demo && r.URL.Query().Get("saved") == "1"
 		data.Members = removableMembers(appData.Members, requestContext)
 		data.ContactEmail = appData.ContactEmail
+		data.Admin = appData.Admin
+		data.AdminWritable = canViewAdmin(requestContext) && requestContext.UserID != "" && !h.demo && h.saveAPIKey != nil
+		data.APIKeySaved = !h.demo && r.URL.Query().Get("result") == "g2b-key-saved"
 		if r.URL.Query().Get("result") == "member-removed" {
 			data.InviteResult = "구성원을 회사에서 제외했습니다."
 		}
@@ -1097,6 +1110,10 @@ func (h *Handler) handlePlatformAction(w http.ResponseWriter, r *http.Request, r
 		return
 	}
 	if err != nil {
+		if errors.Is(err, config.ErrAPIKeyNotConfigured) {
+			http.Error(w, "환경 설정에서 나라장터 API 키를 먼저 등록하세요.", http.StatusConflict)
+			return
+		}
 		http.Error(w, "플랫폼 작업을 실행하지 못했습니다.", http.StatusInternalServerError)
 		return
 	}
