@@ -79,20 +79,11 @@
 })();
 
 (() => {
-  const button = document.querySelector('[data-copy-invitation]');
-  const input = document.querySelector('[data-invitation-link]');
-  if (!button || !input) return;
-  const status = document.querySelector('[data-copy-invitation-status]');
-
-  button.addEventListener('click', async () => {
-    input.focus();
-    input.select();
-    input.setSelectionRange(0, input.value.length);
-    try {
-      await navigator.clipboard.writeText(input.value);
-      if (status) status.textContent = '링크를 복사했습니다.';
-    } catch {
-      if (status) status.textContent = '선택된 링크를 직접 복사해 주세요.';
-    }
-  });
+  // Removal is destructive, so the browser asks before the form is submitted.
+  // Without JavaScript the form still works and the server keeps its checks.
+  for (const form of document.querySelectorAll('form[data-confirm]')) {
+    form.addEventListener('submit', (event) => {
+      if (!window.confirm(form.dataset.confirm)) event.preventDefault();
+    });
+  }
 })();

@@ -2,13 +2,19 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+
+	"namo/internal/model"
 )
 
 type reportRowFunc func(...any) error
@@ -27,12 +33,24 @@ func (r *reportRowsStub) Next() bool { return r.index < len(r.rows) }
 func (r *reportRowsStub) Scan(dest ...any) error {
 	row := r.rows[r.index]
 	r.index++
+	if len(dest) != len(row) {
+		return fmt.Errorf("report row columns: got %d destinations, want %d", len(dest), len(row))
+	}
 	for index := range dest {
 		switch target := dest[index].(type) {
 		case *string:
 			*target = row[index].(string)
+		case **string:
+			if row[index] == nil {
+				*target = nil
+			} else {
+				value := row[index].(string)
+				*target = &value
+			}
 		case *int:
 			*target = row[index].(int)
+		case *bool:
+			*target = row[index].(bool)
 		case *int64:
 			*target = row[index].(int64)
 		case *time.Time:
@@ -56,6 +74,7 @@ func (r *reportRowsStub) Scan(dest ...any) error {
 }
 
 type reportStoreStub struct {
+	batches    []*pgx.Batch
 	rowQueries []string
 	rowArgs    [][]any
 	rowResults []reportRowFunc
@@ -65,6 +84,38 @@ type reportStoreStub struct {
 	execs      []string
 	execArgs   [][]any
 	execRows   []int64
+}
+
+func (s *reportStoreStub) SendBatch(_ context.Context, batch *pgx.Batch) pgx.BatchResults {
+	s.batches = append(s.batches, batch)
+	return refreshBatchResultsStub{}
+}
+
+func TestManualReportReevaluatesTimeDependentFilterBeforeSnapshot(t *testing.T) {
+	now := time.Date(2026, 9, 4, 10, 0, 0, 0, time.UTC)
+	deadline := now.Add(72*time.Hour - time.Minute)
+	payload, err := json.Marshal(model.Notice{Category: model.CategoryGoods, BidNumber: "newly-eligible", BidSequence: "00", Title: "데이터 구매", Deadline: deadline})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stub := &reportStoreStub{queryRows: []*reportRowsStub{
+		{rows: [][]any{{"notice-new", payload, false}}},
+		{rows: [][]any{{"filter-1", []byte(`{"DeadlineWithinDays":3}`), now.Add(-time.Hour)}}},
+		{rows: [][]any{{"notice-new", "데이터 구매", "goods", "기관", "", int64(0), deadline, "", "3일 이내", []byte(`{}`), nil, nil, nil, nil}}},
+	}}
+	stub.rowResults = []reportRowFunc{
+		func(dest ...any) error { *(dest[0].(*string)) = "테넌트"; return nil },
+		func(dest ...any) error {
+			// Stored matches start empty and become visible only after refresh.
+			*(dest[0].(*bool)) = len(stub.batches) == 1 && len(stub.batches[0].QueuedQueries) == 1 && strings.Contains(stub.batches[0].QueuedQueries[0].SQL, "INSERT INTO public.matches")
+			return nil
+		},
+		workRow("report-1", "tenant-1", "테넌트", "", "수동", "manual", "reports/tenant-1/report-1.html", "token-1", now, nil, now, 1),
+	}
+	work, created, err := claimManualReport(context.Background(), stub, "tenant-1", now)
+	if err != nil || !created || len(work.Notices) != 1 || work.Notices[0].Title != "데이터 구매" {
+		t.Fatalf("newly eligible notice missing: work=%+v created=%t err=%v", work, created, err)
+	}
 }
 
 func (s *reportStoreStub) QueryRow(_ context.Context, query string, args ...any) pgx.Row {
@@ -107,7 +158,7 @@ func TestPostgresReportScheduledClaimUsesSnapshotLeaseAndFencing(t *testing.T) {
 			func(dest ...any) error { *(dest[0].(*bool)) = true; return nil },
 			workRow("report-1", "tenant-1", "테넌트", "schedule-1", "매일", "scheduled", "reports/tenant-1/report-1.html", "token-1", dueAt, nil, now, 1),
 		},
-		queryRows: []*reportRowsStub{{rows: [][]any{{"notice-1", "공고", "goods", "기관", "서울", int64(100), now.Add(time.Hour), "https://example.test/1", "필터", []byte(`{"reasons":["region"]}`)}}}},
+		queryRows: []*reportRowsStub{{rows: [][]any{{"notice-1", "공고", "goods", "기관", "서울", int64(100), now.Add(time.Hour), "https://example.test/1", "필터", []byte(`{"reasons":["region"]}`), nil, nil, nil, nil}}}},
 	}
 	work, created, err := claimScheduledReport(context.Background(), stub, "tenant-1", "테넌트", reportSchedule{ID: "schedule-1", Name: "매일"}, dueAt, now, now)
 	if err != nil || !created || work.ReportID != "report-1" || len(work.Notices) != 1 {
@@ -239,6 +290,16 @@ func TestPostgresReportFinalizeFencesSuccessAndFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	joined := strings.Join(success.execs, "\n")
+	// Every bound argument must occur in the SQL. An unused parameter between
+	// $4 and $6 leaves PostgreSQL unable to infer its type in prepared queries.
+	for i, query := range success.execs {
+		for j := range success.execArgs[i] {
+			parameter := regexp.MustCompile(fmt.Sprintf(`\$%d\b`, j+1))
+			if !parameter.MatchString(query) {
+				t.Fatalf("finalize query %d has unused parameter $%d", i+1, j+1)
+			}
+		}
+	}
 	for _, want := range []string{"claim_token = $", "attempts = $", "status = 'generating'", "status = 'generated'", "UPDATE public.digest_windows", "UPDATE public.schedules", "last_success_at"} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("success finalize missing %q: %s", want, joined)
@@ -276,8 +337,8 @@ func TestPostgresReportFinalizeAcceptsTheSameWindowAlreadyCompletedByDigest(t *t
 func TestPostgresReportSnapshotCombinesRulesPerNotice(t *testing.T) {
 	now := time.Date(2026, 9, 2, 10, 0, 0, 0, time.UTC)
 	stub := &reportStoreStub{queryRows: []*reportRowsStub{{rows: [][]any{
-		{"notice-1", "공고", "service", "기관", "서울", int64(100), now, "https://example.test/1", "지역 필터", []byte(`{"details":[{"Code":"region","RuleValue":"서울"}]}`)},
-		{"notice-1", "공고", "service", "기관", "서울", int64(100), now, "https://example.test/1", "금액 필터", []byte(`{"reasons":["min_amount"]}`)},
+		{"notice-1", "공고", "service", "기관", "서울", int64(100), now, "https://example.test/1", "지역 필터", []byte(`{"details":[{"Code":"region","RuleValue":"서울"}]}`), nil, nil, nil, nil},
+		{"notice-1", "공고", "service", "기관", "서울", int64(100), now, "https://example.test/1", "금액 필터", []byte(`{"reasons":["min_amount"]}`), nil, nil, nil, nil},
 	}}}}
 	work := ReportWork{ReportID: "report-1", TenantID: "tenant-1"}
 	if err := loadReportNotices(context.Background(), stub, &work); err != nil {
@@ -285,6 +346,132 @@ func TestPostgresReportSnapshotCombinesRulesPerNotice(t *testing.T) {
 	}
 	if len(work.Notices) != 1 || len(work.Notices[0].Matches) != 2 || work.Notices[0].Matches[0].RuleName != "지역 필터" || len(work.Notices[0].Matches[0].Reasons) != 1 {
 		t.Fatalf("notices=%+v", work.Notices)
+	}
+}
+
+func TestSnapshotRecordsSearchColumns(t *testing.T) {
+	now := time.Date(2026, 9, 4, 10, 0, 0, 0, time.UTC)
+	for _, trigger := range []string{"scheduled", "manual"} {
+		t.Run(trigger, func(t *testing.T) {
+			stub := &reportStoreStub{rowResults: []reportRowFunc{
+				func(dest ...any) error { *(dest[0].(*bool)) = true; return nil },
+				workRow("report-1", "tenant-1", "테넌트", "schedule-1", "매일", trigger, "reports/tenant-1/report-1.html", "token-1", now, nil, now, 1),
+			}}
+			order := "n.published_at DESC NULLS LAST,i.title,i.notice_id,i.matched_at,i.match_id"
+			recorded := "i.matched_at"
+			where := "WHERE i.tenant_id=$1::uuid AND i.schedule_id=$3::uuid AND i.due_at=$4 AND i.window_end_at=$5"
+			wantArgs := []any{"tenant-1", "report-1", "schedule-1", now, now}
+			var err error
+			if trigger == "scheduled" {
+				_, _, err = claimScheduledReport(context.Background(), stub, "tenant-1", "테넌트", reportSchedule{ID: "schedule-1"}, now, now, now)
+			} else {
+				stub.rowResults = append([]reportRowFunc{func(dest ...any) error { *(dest[0].(*string)) = "테넌트"; return nil }}, stub.rowResults...)
+				_, _, err = claimManualReport(context.Background(), stub, "tenant-1", now)
+				order = "n.published_at DESC NULLS LAST,n.title,n.id,m.created_at,m.id"
+				recorded = "m.created_at"
+				where = "WHERE m.tenant_id=$1::uuid AND (n.deadline_at IS NULL OR n.deadline_at >= $3)"
+				wantArgs = []any{"tenant-1", "report-1", now}
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(stub.execs) != 1 {
+				t.Fatalf("snapshot count=%d", len(stub.execs))
+			}
+			query := strings.Join(strings.Fields(stub.execs[0]), " ")
+			for _, want := range []string{
+				"reasons, source_kind,posted_at,collected_at,recorded_at)",
+				"'입찰공고목록-입찰공고',n.published_at,n.collected_at," + recorded,
+				"row_number() OVER (ORDER BY " + order + ")",
+				"ORDER BY " + order, where,
+				"COALESCE(n.payload->>'Agency','')", "COALESCE(NULLIF(n.payload->>'Amount',''),'0')::bigint",
+			} {
+				if !strings.Contains(query, want) {
+					t.Errorf("snapshot missing %q: %s", want, query)
+				}
+			}
+			if strings.Count(query, "ORDER BY "+order) != 2 {
+				t.Errorf("ordinal and output order differ: %s", query)
+			}
+			if strings.Contains(query, "LIMIT") {
+				t.Errorf("snapshot must not be limited: %s", query)
+			}
+			if !reflect.DeepEqual(stub.execArgs[0], wantArgs) {
+				t.Errorf("snapshot args=%v want=%v", stub.execArgs[0], wantArgs)
+			}
+		})
+	}
+}
+
+func TestMatchedKeywordsKeepsOnlyIncludeTerms(t *testing.T) {
+	var payload storedMatchReasons
+	if err := json.Unmarshal([]byte(`{"reasons":["include_any"],"details":[{"Code":"include_any","RuleValue":"경관조명"},{"Code":"include_all","RuleValue":"스마트폴"},{"Code":"include_any","RuleValue":"경관조명"},{"Code":"category","RuleValue":"goods"},{"Code":"deadline_within_days","RuleValue":"3"},{"Code":"exclude_any","RuleValue":"제외"},{"Code":"include_any","RuleValue":""}]}`), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if got := matchedKeywords(payload); !reflect.DeepEqual(got, []string{"경관조명", "스마트폴"}) {
+		t.Fatalf("keywords=%v", got)
+	}
+	if got := matchedKeywords(storedMatchReasons{}); len(got) != 0 {
+		t.Fatalf("empty reasons produced keywords=%v", got)
+	}
+}
+
+func TestLoadReportNoticesMergesKeywordsPerNotice(t *testing.T) {
+	posted := time.Date(2026, 9, 1, 1, 0, 0, 0, time.UTC)
+	collected, recorded := posted.Add(time.Hour), posted.Add(2*time.Hour)
+	later := posted.Add(24 * time.Hour)
+	stub := &reportStoreStub{queryRows: []*reportRowsStub{{rows: [][]any{
+		{"notice-1", "공고", "goods", "기관", "서울", int64(100), later, "https://example.test/1", "첫 필터", []byte(`{"details":[{"Code":"include_any","RuleValue":"경관조명"},{"Code":"include_all","RuleValue":"경관조명"},{"Code":"region","RuleValue":"서울"}]}`), "입찰공고목록-입찰공고", posted, collected, recorded},
+		{"notice-2", "둘째", "service", "기관2", "부산", int64(200), later, "https://example.test/2", "둘째 필터", []byte(`{"details":[{"Code":"include_any","RuleValue":"별도"}]}`), nil, nil, nil, nil},
+		{"notice-1", "변경 공고", "service", "변경 기관", "부산", int64(999), later, "https://example.test/changed", "다음 필터", []byte(`{"details":[{"Code":"include_all","RuleValue":"스마트폴"},{"Code":"include_any","RuleValue":"경관조명"},{"Code":"category","RuleValue":"goods"},{"Code":"deadline_within_days","RuleValue":"3"}]}`), "변경 구분", later, later, later},
+	}}}}
+	work := ReportWork{TenantID: "tenant-1", ReportID: "report-1"}
+	if err := loadReportNotices(context.Background(), stub, &work); err != nil {
+		t.Fatal(err)
+	}
+	if len(work.Notices) != 2 {
+		t.Fatalf("notices=%+v", work.Notices)
+	}
+	first := work.Notices[0]
+	if first.ID != "notice-1" || work.Notices[1].ID != "notice-2" || first.Title != "공고" || first.Agency != "기관" || first.Amount != 100 {
+		t.Errorf("first-seen notice data/order lost: %+v", work.Notices)
+	}
+	if !reflect.DeepEqual(first.Keywords, []string{"경관조명", "스마트폴"}) || !reflect.DeepEqual(work.Notices[1].Keywords, []string{"별도"}) {
+		t.Errorf("keywords=%+v", work.Notices)
+	}
+	if first.SourceKind != "입찰공고목록-입찰공고" || !first.PostedAt.Equal(posted) || !first.CollectedAt.Equal(collected) || !first.RecordedAt.Equal(recorded) {
+		t.Errorf("first-row snapshot fields=%+v", first)
+	}
+	if len(first.Matches) != 2 || first.Matches[0].RuleName != "첫 필터" || first.Matches[1].RuleName != "다음 필터" || !reflect.DeepEqual(first.Matches[0].Reasons, []string{"포함 키워드: 경관조명", "필수 키워드: 경관조명", "지역: 서울"}) {
+		t.Errorf("matches=%+v", first.Matches)
+	}
+	for _, want := range []string{"source_kind,posted_at,collected_at,recorded_at", "WHERE tenant_id=$1::uuid AND report_id=$2::uuid", "ORDER BY ordinal"} {
+		if !strings.Contains(stub.queries[0], want) {
+			t.Errorf("loader missing %q: %s", want, stub.queries[0])
+		}
+	}
+	if !reflect.DeepEqual(stub.queryArgs[0], []any{"tenant-1", "report-1"}) {
+		t.Errorf("loader args=%v", stub.queryArgs[0])
+	}
+}
+
+func TestLoadReportNoticesOldNullSearchColumns(t *testing.T) {
+	stub := &reportStoreStub{queryRows: []*reportRowsStub{{rows: [][]any{
+		{"old", "과거 공고", "goods", "기관", "서울", int64(100), time.Time{}, "https://example.test/old", "과거 필터", []byte(`{"reasons":["include_any"]}`), nil, nil, nil, nil},
+	}}}}
+	work := ReportWork{TenantID: "tenant-1", ReportID: "old-report"}
+	if err := loadReportNotices(context.Background(), stub, &work); err != nil {
+		t.Fatal(err)
+	}
+	if len(work.Notices) != 1 {
+		t.Fatalf("notices=%+v", work.Notices)
+	}
+	notice := work.Notices[0]
+	if notice.SourceKind != "" || !notice.PostedAt.IsZero() || !notice.CollectedAt.IsZero() || !notice.RecordedAt.IsZero() || len(notice.Keywords) != 0 {
+		t.Errorf("old snapshot invented data: %+v", notice)
+	}
+	if len(notice.Matches) != 1 || !reflect.DeepEqual(notice.Matches[0].Reasons, []string{"포함 키워드"}) {
+		t.Errorf("old reasons lost: %+v", notice.Matches)
 	}
 }
 

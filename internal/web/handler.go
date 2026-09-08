@@ -15,48 +15,56 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
+	"namo/internal/config"
 	ui "namo/web"
 )
 
 type pageData struct {
-	Title         string
-	Active        string
-	State         string
-	Saved         bool
-	UserName      string
-	TenantName    string
-	Notices       []noticeView
-	Notice        noticeView
-	Filters       []filterView
-	Recipients    []recipientView
-	Reports       []ReportView
-	Members       []memberView
-	Tenants       []tenantView
-	CurrentDate   string
-	SearchQuery   string
-	Category      string
-	Region        string
-	Role          string
-	CSRFToken     string
-	Writable      bool
-	Dashboard     DashboardView
-	Demo          bool
-	LoginEnabled  bool
-	DeliveryTime  string
-	Timezone      string
-	ContactEmail  string
-	Admin         AdminView
-	DeliveryDays  []int
-	AdminWritable bool
-	AdminResult   string
-	ReportEmpty   bool
-	InviteResult  string
-	InviteURL     string
-	Invitation    InvitationView
-	InviteExpires string
-	InviteToken   string
+	Title          string
+	Active         string
+	State          string
+	Saved          bool
+	APIKeySaved    bool
+	Deleted        bool
+	UserName       string
+	TenantName     string
+	Notices        []noticeView
+	Notice         noticeView
+	Filters        []filterView
+	Recipients     []recipientView
+	Reports        []ReportView
+	Members        []memberView
+	Tenants        []tenantView
+	CurrentDate    string
+	SearchQuery    string
+	SelectedFilter string
+	Category       string
+	Region         string
+	Pagination     paginationView
+	Role           string
+	CSRFToken      string
+	Writable       bool
+	Dashboard      DashboardView
+	Demo           bool
+	LoginEnabled   bool
+	DeliveryTime   string
+	Timezone       string
+	ContactEmail   string
+	Admin          AdminView
+	DeliveryDays   []int
+	AdminWritable  bool
+	AdminResult    string
+	ReportEmpty    bool
+	InviteResult   string
+	Invitation     InvitationView
+	InviteExpires  string
+	InviteToken    string
+	SignupEnabled  bool
+	Accounts       []AccountView
+	TenantOptions  []TenantOption
 }
 
 // RequestContext is the authenticated identity supplied by the outer app.
@@ -87,11 +95,13 @@ type DashboardView struct {
 
 // AdminView contains platform collection health.
 type AdminView struct {
-	Healthy        bool
-	LastCollected  string
-	CollectedCount int
-	FailedJobs     int
-	ReportDir      string
+	APIKeyConfigured  bool
+	APIKeyUnavailable bool
+	Healthy           bool
+	LastCollected     string
+	CollectedCount    int
+	FailedJobs        int
+	ReportDir         string
 }
 
 // ReportView is one tenant-visible report artifact and its generation state.
@@ -110,18 +120,31 @@ type ReportDownload struct {
 
 // NoticeView is a notice row/detail prepared by integration.
 type NoticeView struct {
-	ID        string
-	Title     string
-	Category  string
-	Agency    string
-	Region    string
-	Amount    string
-	Deadline  string
-	SourceURL string
-	Reasons   []string
+	SourceKind     string
+	Keyword        string
+	Trade          string
+	CollectedDate  string
+	CollectedClock string
+	PostedAt       string
+	FilterKeywords map[string]string
+	ID             string
+	Title          string
+	Category       string
+	Agency         string
+	Region         string
+	Amount         string
+	Deadline       string
+	SourceURL      string
+	Reasons        []string
+	FilterReasons  map[string][]string
 }
 
 type noticeView = NoticeView
+
+type paginationView struct {
+	Page, Pages, PageSize, Total int
+	PreviousURL, NextURL         string
+}
 
 // FilterView is a tenant filter prepared by integration.
 type FilterView struct {
@@ -145,38 +168,65 @@ type recipientView = RecipientView
 
 // MemberView is a tenant member prepared by integration.
 type MemberView struct {
-	Name  string
-	Email string
-	Role  string
+	UserID    string
+	Name      string
+	Email     string
+	Role      string
+	Removable bool
 }
 
 type memberView = MemberView
 
 // TenantView is a platform tenant prepared by integration.
 type TenantView struct {
-	Name       string
-	Members    int
-	LastDigest string
-	State      string
+	Name        string
+	Members     int
+	LastDigest  string
+	State       string
+	AdminName   string
+	AdminEmail  string
+	ContactMail string
 }
 
 type tenantView = TenantView
 
+// AccountView is one member account and its tenant assignment as shown on the
+// platform administrator screen.
+type AccountView struct {
+	UserID      string
+	Email       string
+	DisplayName string
+	TenantID    string
+	TenantName  string
+	Created     string
+	Role        string
+	RoleLabel   string
+	Assigned    bool
+}
+
+// TenantOption is one assignable tenant.
+type TenantOption struct {
+	ID   string
+	Name string
+}
+
 // AppData is the read model loaded for server-rendered pages.
 type AppData struct {
-	Dashboard    DashboardView
-	Notices      []NoticeView
-	Filters      []FilterView
-	Recipients   []RecipientView
-	Reports      []ReportView
-	Members      []MemberView
-	Tenants      []TenantView
-	DeliveryTime string
-	DeliveryDays []int
-	Timezone     string
-	ContactEmail string
-	Admin        AdminView
-	Demo         bool
+	Dashboard     DashboardView
+	Notices       []NoticeView
+	Filters       []FilterView
+	Recipients    []RecipientView
+	Reports       []ReportView
+	Members       []MemberView
+	Tenants       []TenantView
+	Accounts      []AccountView
+	TenantOptions []TenantOption
+	DeliveryTime  string
+	DeliveryDays  []int
+	Timezone      string
+	ContactEmail  string
+	Admin         AdminView
+	Demo          bool
 }
 
 // PageRequest identifies the read surface for selective backend loading.
@@ -198,7 +248,7 @@ type FilterCommand struct {
 	Category        string
 	Region          string
 	MinimumAmount   *int64
-	DeadlineDays    int
+	DeadlineDays    *int
 	Agency          string
 }
 
@@ -206,6 +256,11 @@ type FilterCommand struct {
 type ToggleFilterCommand struct {
 	FilterID string
 	Enabled  bool
+}
+
+// DeleteFilterCommand identifies one tenant-owned filter to remove.
+type DeleteFilterCommand struct {
+	FilterID string
 }
 
 // NotificationCommand is a validated digest schedule request.
@@ -221,21 +276,36 @@ type RecipientCommand struct {
 	Email string
 }
 
+// AssignAccountCommand grants company access with a role, or revokes access
+// when TenantID is empty.
+type AssignAccountCommand struct {
+	UserID   string
+	TenantID string
+	Role     string
+}
+
+// AccountCommand names one target account.
+type AccountCommand struct {
+	UserID string
+}
+
 // SettingsCommand is a validated tenant settings request.
 type SettingsCommand struct {
 	TenantName   string
 	ContactEmail string
 }
 
+var ErrTenantExists = errors.New("tenant is already registered")
+var ErrAccountRole = errors.New("account role requires a company")
 var ErrInvitationUnavailable = errors.New("invitation is unavailable")
 var ErrInvitationMailDelivery = errors.New("invitation was saved but mail delivery failed")
 var ErrInvitationPending = errors.New("invitation is already pending")
 var ErrReportNotFound = errors.New("report is unavailable")
 var ErrNoReportMatches = errors.New("no eligible report matches")
 
-// TenantInviteCommand creates a tenant and its first administrator invite.
-type TenantInviteCommand struct {
-	TenantName, ContactEmail, AdminName, AdminEmail string
+// TenantCommand registers one company and its administrator contact.
+type TenantCommand struct {
+	Name, ContactEmail, AdminName, AdminEmail string
 }
 
 // MemberInviteCommand creates or replaces an invitation inside one tenant.
@@ -259,8 +329,6 @@ type InvitationResult struct {
 
 // Onboarding is the public and administrator invitation boundary.
 type Onboarding interface {
-	InviteTenant(context.Context, RequestContext, TenantInviteCommand) (InvitationResult, error)
-	InviteMember(context.Context, RequestContext, MemberInviteCommand) (InvitationResult, error)
 	Invitation(context.Context, string) (InvitationView, error)
 	AcceptInvitation(context.Context, AcceptInviteCommand) error
 }
@@ -269,19 +337,26 @@ type Onboarding interface {
 type Actions interface {
 	SaveFilter(context.Context, RequestContext, FilterCommand) error
 	ToggleFilter(context.Context, RequestContext, ToggleFilterCommand) error
+	DeleteFilter(context.Context, RequestContext, DeleteFilterCommand) error
 	SaveNotification(context.Context, RequestContext, NotificationCommand) error
 	SaveSettings(context.Context, RequestContext, SettingsCommand) error
+	AssignAccountTenant(context.Context, RequestContext, AssignAccountCommand) error
+	CreateTenant(context.Context, RequestContext, TenantCommand) error
+	RemoveMember(context.Context, RequestContext, AccountCommand) error
+	DeleteAccount(context.Context, RequestContext, AccountCommand) error
 	AddRecipient(context.Context, RequestContext, RecipientCommand) error
 	RunCollection(context.Context, RequestContext) error
 	SendTestMail(context.Context, RequestContext) error
 	SaveReportSchedule(context.Context, RequestContext, NotificationCommand) error
 	GenerateReport(context.Context, RequestContext) error
 	RetryReport(context.Context, RequestContext, string) error
+	DeleteReport(context.Context, RequestContext, string) error
 	OpenReport(context.Context, RequestContext, string) (ReportDownload, error)
 }
 
 // Options configures the production handler behind authentication middleware.
 type Options struct {
+	SaveAPIKey func(context.Context, RequestContext, string) error
 	Backend    Backend
 	Actions    Actions
 	Onboarding Onboarding
@@ -291,6 +366,7 @@ type Options struct {
 // Handler serves the embeddable web interface. Domain integration can replace
 // the local page models without changing template routes.
 type Handler struct {
+	saveAPIKey func(context.Context, RequestContext, string) error
 	templates  *template.Template
 	assets     http.Handler
 	backend    Backend
@@ -337,6 +413,7 @@ func newHandler(options Options, demo bool) (http.Handler, error) {
 		return nil, err
 	}
 	return &Handler{
+		saveAPIKey: options.SaveAPIKey,
 		templates:  templates,
 		assets:     http.FileServer(http.FS(assetsFS)),
 		backend:    options.Backend,
@@ -365,6 +442,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "플랫폼 관리자 권한이 필요합니다.", http.StatusForbidden)
 		return
 	}
+	// A self-service account carries no tenant until a platform administrator
+	// assigns one, so it must not reach tenant screens or commands.
+	if awaitingTenant(requestContext) {
+		h.renderPending(w, r, requestContext)
+		return
+	}
 	if r.URL.Path == "/notifications" {
 		if !allows(r.Method, http.MethodGet, http.MethodHead) {
 			methodNotAllowed(w, http.MethodGet, http.MethodHead)
@@ -375,8 +458,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	downloadReportID, downloadRoute := reportRouteID(r.URL.Path, "download")
 	retryReportID, retryRoute := reportRouteID(r.URL.Path, "retry")
+	deleteReportID, deleteRoute := reportRouteID(r.URL.Path, "delete")
 	var appData AppData
-	if allows(r.Method, http.MethodGet, http.MethodHead) && !downloadRoute && r.URL.Path != "/login" && r.URL.Path != "/accept-invite" && r.URL.Path != "/" {
+	if allows(r.Method, http.MethodGet, http.MethodHead) && !downloadRoute && r.URL.Path != "/login" && r.URL.Path != "/signup" && r.URL.Path != "/accept-invite" && r.URL.Path != "/" {
 		appData, err = h.backend.Load(r.Context(), requestContext, PageRequest{Path: r.URL.Path})
 		if err != nil {
 			http.Error(w, "화면 데이터를 불러오지 못했습니다.", http.StatusInternalServerError)
@@ -406,10 +490,30 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		data := page("로그인", "", requestContext, canMutateTenant(requestContext), appData.Demo)
 		data.LoginEnabled = !h.demo
+		data.SignupEnabled = !h.demo
 		if !h.demo && r.URL.Query().Get("accepted") == "1" {
 			data.InviteResult = "계정을 만들었습니다. 새 비밀번호로 로그인하세요."
 		}
 		h.render(w, "login", data)
+	case r.URL.Path == "/signup":
+		if r.Method == http.MethodPost {
+			// The authentication middleware owns account creation. A POST only
+			// arrives here when that middleware is absent, as in the demo.
+			if h.demo {
+				demoNotImplemented(w)
+				return
+			}
+			methodNotAllowed(w, http.MethodGet, http.MethodHead)
+			return
+		}
+		if !allows(r.Method, http.MethodGet, http.MethodHead) {
+			methodNotAllowed(w, http.MethodGet, http.MethodHead)
+			return
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		data := page("회원가입", "", requestContext, false, appData.Demo)
+		data.SignupEnabled = !h.demo
+		h.render(w, "signup", data)
 	case r.URL.Path == "/accept-invite":
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("Cache-Control", "no-store")
@@ -451,9 +555,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		data := page("공고 목록", "notices", requestContext, canMutateTenant(requestContext), appData.Demo)
 		data.State = state(r)
 		data.SearchQuery = strings.TrimSpace(r.URL.Query().Get("q"))
+		data.SelectedFilter = strings.TrimSpace(r.URL.Query().Get("filter"))
 		data.Category = r.URL.Query().Get("category")
 		data.Region = r.URL.Query().Get("region")
-		data.Notices = filterNotices(appData.Notices, data.SearchQuery, data.Category, data.Region)
+		data.Filters = appData.Filters
+		filtered := filterNotices(appData.Notices, data.SearchQuery, data.SelectedFilter, data.Category, data.Region)
+		data.Notices, data.Pagination = paginateNotices(filtered, r.URL.Query())
 		if data.State == "empty" {
 			data.Notices = nil
 		}
@@ -470,6 +577,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		data := page("공고 상세", "notices", requestContext, canMutateTenant(requestContext), appData.Demo)
+		data.SelectedFilter = strings.TrimSpace(r.URL.Query().Get("filter"))
+		if data.SelectedFilter != "" {
+			filtered := filterNotices([]noticeView{notice}, "", data.SelectedFilter, "", "")
+			if len(filtered) == 0 {
+				h.renderStatus(w, http.StatusNotFound, "필터에 없는 공고", "선택한 필터의 공고 목록으로 돌아가 주세요.")
+				return
+			}
+			notice = filtered[0]
+		}
 		data.Notice = notice
 		h.render(w, "notice-detail", data)
 	case r.URL.Path == "/filters":
@@ -491,6 +607,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		data := page("필터 관리", "filters", requestContext, canMutateTenant(requestContext), appData.Demo)
 		data.Saved = !h.demo && r.URL.Query().Get("saved") == "1"
+		data.Deleted = !h.demo && r.URL.Query().Get("deleted") == "1"
 		data.Filters = appData.Filters
 		h.render(w, "filters", data)
 	case r.URL.Path == "/filters/toggle":
@@ -507,6 +624,20 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.handleFilterToggle(w, r, requestContext)
+	case r.URL.Path == "/filters/delete":
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, http.MethodPost)
+			return
+		}
+		if h.demo {
+			demoNotImplemented(w)
+			return
+		}
+		if requestContext.TenantID == "" || requestContext.Role != "tenant_admin" {
+			http.Error(w, "테넌트 관리자 권한이 필요합니다.", http.StatusForbidden)
+			return
+		}
+		h.handleFilterDelete(w, r, requestContext)
 	case r.URL.Path == "/reports":
 		if r.Method == http.MethodPost {
 			if h.demo {
@@ -542,6 +673,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			data.ReportEmpty = true
 		case "retried":
 			data.AdminResult = "리포트 재시도를 요청했습니다."
+		case "deleted":
+			data.AdminResult = "리포트를 삭제했습니다."
 		}
 		h.render(w, "reports", data)
 	case r.URL.Path == "/reports/generate":
@@ -572,6 +705,20 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.handleRetryReport(w, r, requestContext, retryReportID)
+	case deleteRoute:
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, http.MethodPost)
+			return
+		}
+		if h.demo {
+			demoNotImplemented(w)
+			return
+		}
+		if !canMutateReport(requestContext) {
+			http.Error(w, "테넌트 관리자 권한이 필요합니다.", http.StatusForbidden)
+			return
+		}
+		h.handleDeleteReport(w, r, requestContext, deleteReportID)
 	case downloadRoute:
 		if !allows(r.Method, http.MethodGet, http.MethodHead) {
 			methodNotAllowed(w, http.MethodGet, http.MethodHead)
@@ -582,7 +729,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.handleReportDownload(w, r, requestContext, downloadReportID)
+	case r.URL.Path == "/settings/g2b-api-key":
+		h.handleSaveAPIKey(w, r, requestContext)
 	case r.URL.Path == "/settings":
+		w.Header().Set("Cache-Control", "no-store")
 		if r.Method == http.MethodPost {
 			if h.demo {
 				demoNotImplemented(w)
@@ -601,13 +751,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		data := page("환경 설정", "settings", requestContext, canMutateTenant(requestContext), appData.Demo)
 		data.Saved = !h.demo && r.URL.Query().Get("saved") == "1"
-		data.Members = appData.Members
+		data.Members = removableMembers(appData.Members, requestContext)
 		data.ContactEmail = appData.ContactEmail
-		if r.URL.Query().Get("result") == "member-invited" {
-			data.InviteResult = "구성원 초대를 보냈습니다."
+		data.Admin = appData.Admin
+		data.AdminWritable = canViewAdmin(requestContext) && requestContext.UserID != "" && !h.demo && h.saveAPIKey != nil
+		data.APIKeySaved = !h.demo && r.URL.Query().Get("result") == "g2b-key-saved"
+		if r.URL.Query().Get("result") == "member-removed" {
+			data.InviteResult = "구성원을 회사에서 제외했습니다."
 		}
 		h.render(w, "settings", data)
-	case r.URL.Path == "/settings/invitations":
+	case r.URL.Path == "/settings/members":
 		if r.Method != http.MethodPost {
 			methodNotAllowed(w, http.MethodPost)
 			return
@@ -617,10 +770,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if requestContext.Role != "tenant_admin" || requestContext.TenantID == "" {
-			http.Error(w, "테넌트 관리자 권한이 필요합니다.", http.StatusForbidden)
+			http.Error(w, "회사 관리자 권한이 필요합니다.", http.StatusForbidden)
 			return
 		}
-		h.handleInviteMember(w, r, requestContext)
+		h.handleRemoveMember(w, r, requestContext)
 	case r.URL.Path == "/admin/tenants":
 		if r.Method != http.MethodPost {
 			methodNotAllowed(w, http.MethodPost)
@@ -630,7 +783,27 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			demoNotImplemented(w)
 			return
 		}
-		h.handleInviteTenant(w, r, requestContext)
+		h.handleCreateTenant(w, r, requestContext)
+	case r.URL.Path == "/admin/accounts/delete":
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, http.MethodPost)
+			return
+		}
+		if h.demo {
+			demoNotImplemented(w)
+			return
+		}
+		h.handleDeleteAccount(w, r, requestContext)
+	case r.URL.Path == "/admin/accounts":
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, http.MethodPost)
+			return
+		}
+		if h.demo {
+			demoNotImplemented(w)
+			return
+		}
+		h.handleAssignAccount(w, r, requestContext)
 	case r.URL.Path == "/admin/collect":
 		if r.Method != http.MethodPost {
 			methodNotAllowed(w, http.MethodPost)
@@ -648,13 +821,21 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		data := page("플랫폼 관리", "admin", requestContext, canMutateTenant(requestContext), appData.Demo)
 		data.Tenants = appData.Tenants
+		data.Accounts = appData.Accounts
+		data.TenantOptions = appData.TenantOptions
 		data.Admin = appData.Admin
 		data.AdminWritable = !h.demo
 		switch r.URL.Query().Get("result") {
 		case "collection":
 			data.AdminResult = "수집 작업을 시작했습니다."
-		case "tenant-invited":
-			data.AdminResult = "테넌트 관리자 초대를 보냈습니다."
+		case "tenant-created":
+			data.AdminResult = "회사를 등록했습니다. 회원 계정 배정에서 선택할 수 있습니다."
+		case "account-assigned":
+			data.AdminResult = "계정의 회사와 권한을 반영했습니다."
+		case "account-revoked":
+			data.AdminResult = "계정의 회사 배정을 해제했습니다."
+		case "account-deleted":
+			data.AdminResult = "계정을 삭제했습니다. 해당 계정의 로그인 세션도 함께 종료되었습니다."
 		}
 		h.render(w, "admin", data)
 	default:
@@ -667,10 +848,14 @@ func (h *Handler) handleSaveFilter(w http.ResponseWriter, r *http.Request, reque
 		http.Error(w, "요청을 확인할 수 없습니다.", http.StatusForbidden)
 		return
 	}
-	deadlineDays, err := strconv.Atoi(r.FormValue("deadline_days"))
-	if err != nil {
-		http.Error(w, "마감 여유일을 확인해 주세요.", http.StatusBadRequest)
-		return
+	var deadlineDays *int
+	if raw := strings.TrimSpace(r.FormValue("deadline_days")); raw != "" {
+		days, err := strconv.Atoi(raw)
+		if err != nil || days < 1 || days > 365 {
+			http.Error(w, "마감 여유일은 1~365 사이로 입력하거나 비워 주세요.", http.StatusBadRequest)
+			return
+		}
+		deadlineDays = &days
 	}
 	var minimumAmount *int64
 	if raw := strings.TrimSpace(r.FormValue("min_amount")); raw != "" {
@@ -695,7 +880,7 @@ func (h *Handler) handleSaveFilter(w http.ResponseWriter, r *http.Request, reque
 	if command.IncludeMode == "" {
 		command.IncludeMode = "any"
 	}
-	if command.Name == "" || command.DeadlineDays < 0 ||
+	if command.Name == "" ||
 		!allowedValue(command.IncludeMode, "any", "all") ||
 		!allowedValue(command.Category, "공사", "용역", "물품", "외자") ||
 		utf8.RuneCountInString(command.Region) > 128 {
@@ -739,6 +924,23 @@ func (h *Handler) handleFilterToggle(w http.ResponseWriter, r *http.Request, req
 		return
 	}
 	http.Redirect(w, r, "/filters?saved=1", http.StatusSeeOther)
+}
+
+func (h *Handler) handleFilterDelete(w http.ResponseWriter, r *http.Request, requestContext RequestContext) {
+	if !validCSRF(r, requestContext) {
+		http.Error(w, "요청을 확인할 수 없습니다.", http.StatusForbidden)
+		return
+	}
+	command := DeleteFilterCommand{FilterID: strings.TrimSpace(r.FormValue("filter"))}
+	if command.FilterID == "" {
+		http.Error(w, "필터 번호가 올바르지 않습니다.", http.StatusBadRequest)
+		return
+	}
+	if err := h.actions.DeleteFilter(r.Context(), requestContext, command); err != nil {
+		http.Error(w, "필터를 삭제하지 못했습니다.", http.StatusInternalServerError)
+		return
+	}
+	http.Redirect(w, r, "/filters?deleted=1", http.StatusSeeOther)
 }
 
 func (h *Handler) handleSaveReportSchedule(w http.ResponseWriter, r *http.Request, requestContext RequestContext) {
@@ -796,6 +998,22 @@ func (h *Handler) handleRetryReport(w http.ResponseWriter, r *http.Request, requ
 		return
 	}
 	http.Redirect(w, r, "/reports?result=retried", http.StatusSeeOther)
+}
+
+func (h *Handler) handleDeleteReport(w http.ResponseWriter, r *http.Request, requestContext RequestContext, reportID string) {
+	if !validCSRF(r, requestContext) {
+		http.Error(w, "요청을 확인할 수 없습니다.", http.StatusForbidden)
+		return
+	}
+	if err := h.actions.DeleteReport(r.Context(), requestContext, reportID); err != nil {
+		if errors.Is(err, ErrReportNotFound) {
+			h.renderStatus(w, http.StatusNotFound, "삭제할 수 없는 리포트", "생성이 완료되었거나 실패한 리포트인지 확인해 주세요.")
+			return
+		}
+		http.Error(w, "리포트를 삭제하지 못했습니다. 목록으로 돌아가 다시 시도해 주세요.", http.StatusInternalServerError)
+		return
+	}
+	http.Redirect(w, r, "/reports?result=deleted", http.StatusSeeOther)
 }
 
 func (h *Handler) handleReportDownload(w http.ResponseWriter, r *http.Request, requestContext RequestContext, reportID string) {
@@ -892,10 +1110,142 @@ func (h *Handler) handlePlatformAction(w http.ResponseWriter, r *http.Request, r
 		return
 	}
 	if err != nil {
+		if errors.Is(err, config.ErrAPIKeyNotConfigured) {
+			http.Error(w, "환경 설정에서 나라장터 API 키를 먼저 등록하세요.", http.StatusConflict)
+			return
+		}
 		http.Error(w, "플랫폼 작업을 실행하지 못했습니다.", http.StatusInternalServerError)
 		return
 	}
 	http.Redirect(w, r, "/admin?result="+action, http.StatusSeeOther)
+}
+
+func (h *Handler) handleCreateTenant(w http.ResponseWriter, r *http.Request, requestContext RequestContext) {
+	if !canViewAdmin(requestContext) {
+		http.Error(w, "플랫폼 관리자 권한이 필요합니다.", http.StatusForbidden)
+		return
+	}
+	if !validCSRF(r, requestContext) {
+		http.Error(w, "요청을 확인할 수 없습니다.", http.StatusForbidden)
+		return
+	}
+	command := TenantCommand{
+		Name:      strings.TrimSpace(r.FormValue("tenant_name")),
+		AdminName: strings.TrimSpace(r.FormValue("admin_name")),
+	}
+	contactEmail, contactErr := plainEmail(r.FormValue("contact_email"))
+	adminEmail, adminErr := plainEmail(r.FormValue("admin_email"))
+	command.ContactEmail, command.AdminEmail = contactEmail, adminEmail
+	if command.Name == "" || command.AdminName == "" || contactErr != nil || adminErr != nil ||
+		utf8.RuneCountInString(command.Name) > 128 || utf8.RuneCountInString(command.AdminName) > 128 {
+		http.Error(w, "회사명, 대표 이메일, 관리자 이름, 관리자 이메일을 확인해 주세요.", http.StatusBadRequest)
+		return
+	}
+	if err := h.actions.CreateTenant(r.Context(), requestContext, command); err != nil {
+		if errors.Is(err, ErrTenantExists) {
+			http.Error(w, "같은 회사명과 대표 이메일이 이미 등록되어 있습니다.", http.StatusConflict)
+			return
+		}
+		http.Error(w, "회사를 등록하지 못했습니다.", http.StatusInternalServerError)
+		return
+	}
+	http.Redirect(w, r, "/admin?result=tenant-created", http.StatusSeeOther)
+}
+
+func (h *Handler) handleAssignAccount(w http.ResponseWriter, r *http.Request, requestContext RequestContext) {
+	if !canViewAdmin(requestContext) {
+		http.Error(w, "플랫폼 관리자 권한이 필요합니다.", http.StatusForbidden)
+		return
+	}
+	if !validCSRF(r, requestContext) {
+		http.Error(w, "요청을 확인할 수 없습니다.", http.StatusForbidden)
+		return
+	}
+	command := AssignAccountCommand{
+		UserID:   strings.TrimSpace(r.FormValue("user_id")),
+		TenantID: strings.TrimSpace(r.FormValue("tenant_id")),
+		Role:     strings.TrimSpace(r.FormValue("role")),
+	}
+	if command.Role == "" {
+		command.Role = "member"
+	}
+	if r.FormValue("mode") == "revoke" {
+		command.TenantID, command.Role = "", "member"
+	}
+	if command.UserID == "" || !allowedValue(command.Role, "member", "tenant_admin") {
+		http.Error(w, "대상 계정과 권한을 확인해 주세요.", http.StatusBadRequest)
+		return
+	}
+	if command.TenantID == "" && command.Role != "member" {
+		http.Error(w, "회사 관리자 권한은 회사를 함께 선택해야 합니다.", http.StatusBadRequest)
+		return
+	}
+	if err := h.actions.AssignAccountTenant(r.Context(), requestContext, command); err != nil {
+		if errors.Is(err, ErrAccountRole) {
+			http.Error(w, "회사 관리자 권한은 회사를 함께 선택해야 합니다.", http.StatusBadRequest)
+			return
+		}
+		http.Error(w, "계정 배정을 반영하지 못했습니다.", http.StatusInternalServerError)
+		return
+	}
+	result := "account-assigned"
+	if command.TenantID == "" {
+		result = "account-revoked"
+	}
+	http.Redirect(w, r, "/admin?result="+result, http.StatusSeeOther)
+}
+
+func (h *Handler) handleRemoveMember(w http.ResponseWriter, r *http.Request, requestContext RequestContext) {
+	if !validCSRF(r, requestContext) {
+		http.Error(w, "요청을 확인할 수 없습니다.", http.StatusForbidden)
+		return
+	}
+	command := AccountCommand{UserID: strings.TrimSpace(r.FormValue("user_id"))}
+	if command.UserID == "" {
+		http.Error(w, "대상 구성원을 확인해 주세요.", http.StatusBadRequest)
+		return
+	}
+	if command.UserID == requestContext.UserID {
+		http.Error(w, "자신은 회사에서 제외할 수 없습니다.", http.StatusBadRequest)
+		return
+	}
+	if err := h.actions.RemoveMember(r.Context(), requestContext, command); err != nil {
+		http.Error(w, "구성원을 제외하지 못했습니다.", http.StatusInternalServerError)
+		return
+	}
+	http.Redirect(w, r, "/settings?result=member-removed", http.StatusSeeOther)
+}
+
+func (h *Handler) handleDeleteAccount(w http.ResponseWriter, r *http.Request, requestContext RequestContext) {
+	if !canViewAdmin(requestContext) {
+		http.Error(w, "플랫폼 관리자 권한이 필요합니다.", http.StatusForbidden)
+		return
+	}
+	if !validCSRF(r, requestContext) {
+		http.Error(w, "요청을 확인할 수 없습니다.", http.StatusForbidden)
+		return
+	}
+	command := AccountCommand{UserID: strings.TrimSpace(r.FormValue("user_id"))}
+	if command.UserID == "" || command.UserID == requestContext.UserID {
+		http.Error(w, "삭제할 계정을 확인해 주세요.", http.StatusBadRequest)
+		return
+	}
+	if err := h.actions.DeleteAccount(r.Context(), requestContext, command); err != nil {
+		http.Error(w, "계정을 삭제하지 못했습니다.", http.StatusInternalServerError)
+		return
+	}
+	http.Redirect(w, r, "/admin?result=account-deleted", http.StatusSeeOther)
+}
+
+// renderPending shows the waiting screen for an account without a tenant.
+func (h *Handler) renderPending(w http.ResponseWriter, r *http.Request, requestContext RequestContext) {
+	if !allows(r.Method, http.MethodGet, http.MethodHead) {
+		http.Error(w, "테넌트 배정이 끝난 뒤에 이용할 수 있습니다.", http.StatusForbidden)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	data := page("배정 대기", "", requestContext, false, false)
+	h.render(w, "pending", data)
 }
 
 func (h *Handler) handleSaveSettings(w http.ResponseWriter, r *http.Request, requestContext RequestContext) {
@@ -917,77 +1267,6 @@ func (h *Handler) handleSaveSettings(w http.ResponseWriter, r *http.Request, req
 		return
 	}
 	http.Redirect(w, r, "/settings?saved=1", http.StatusSeeOther)
-}
-
-func (h *Handler) handleInviteTenant(w http.ResponseWriter, r *http.Request, requestContext RequestContext) {
-	if !canViewAdmin(requestContext) {
-		http.Error(w, "플랫폼 관리자 권한이 필요합니다.", http.StatusForbidden)
-		return
-	}
-	if !validCSRF(r, requestContext) {
-		http.Error(w, "요청을 확인할 수 없습니다.", http.StatusForbidden)
-		return
-	}
-	command := TenantInviteCommand{
-		TenantName: strings.TrimSpace(r.FormValue("tenant_name")), ContactEmail: strings.TrimSpace(r.FormValue("contact_email")),
-		AdminName: strings.TrimSpace(r.FormValue("admin_name")), AdminEmail: strings.TrimSpace(r.FormValue("admin_email")),
-	}
-	var err error
-	command.ContactEmail, err = plainEmail(command.ContactEmail)
-	if command.TenantName == "" || command.AdminName == "" || err != nil {
-		http.Error(w, "회사 정보와 초기 관리자 정보를 확인해 주세요.", http.StatusBadRequest)
-		return
-	}
-	command.AdminEmail, err = plainEmail(command.AdminEmail)
-	if err != nil {
-		http.Error(w, "회사 정보와 초기 관리자 정보를 확인해 주세요.", http.StatusBadRequest)
-		return
-	}
-	if h.onboarding == nil {
-		http.Error(w, "초대 기능을 사용할 수 없습니다.", http.StatusServiceUnavailable)
-		return
-	}
-	result, err := h.onboarding.InviteTenant(r.Context(), requestContext, command)
-	if err != nil {
-		handleInvitationError(w, err)
-		return
-	}
-	h.renderInvitationResult(w, requestContext, "admin", "테넌트 초대 링크", result)
-}
-
-func (h *Handler) handleInviteMember(w http.ResponseWriter, r *http.Request, requestContext RequestContext) {
-	if !validCSRF(r, requestContext) {
-		http.Error(w, "요청을 확인할 수 없습니다.", http.StatusForbidden)
-		return
-	}
-	command := MemberInviteCommand{
-		Name: strings.TrimSpace(r.FormValue("name")), Email: strings.TrimSpace(r.FormValue("email")), Role: strings.TrimSpace(r.FormValue("role")),
-	}
-	var err error
-	command.Email, err = plainEmail(command.Email)
-	if command.Name == "" || err != nil || !allowedValue(command.Role, "member", "tenant_admin") || command.Role == "" {
-		http.Error(w, "구성원 이름, 이메일, 역할을 확인해 주세요.", http.StatusBadRequest)
-		return
-	}
-	if h.onboarding == nil {
-		http.Error(w, "초대 기능을 사용할 수 없습니다.", http.StatusServiceUnavailable)
-		return
-	}
-	result, err := h.onboarding.InviteMember(r.Context(), requestContext, command)
-	if err != nil {
-		handleInvitationError(w, err)
-		return
-	}
-	h.renderInvitationResult(w, requestContext, "settings", "구성원 초대 링크", result)
-}
-
-func (h *Handler) renderInvitationResult(w http.ResponseWriter, requestContext RequestContext, active, title string, result InvitationResult) {
-	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("Referrer-Policy", "no-referrer")
-	data := page(title, active, requestContext, false, false)
-	data.InviteURL = result.URL
-	data.InviteExpires = result.ExpiresAt.In(time.FixedZone("Asia/Seoul", 9*60*60)).Format("2006.01.02 15:04")
-	h.render(w, "invitation-result", data)
 }
 
 func (h *Handler) handleAcceptInvitation(w http.ResponseWriter, r *http.Request, requestContext RequestContext) {
@@ -1050,20 +1329,6 @@ func plainEmail(value string) (string, error) {
 		return "", errors.New("plain email required")
 	}
 	return strings.ToLower(address.Address), nil
-}
-
-func handleInvitationError(w http.ResponseWriter, err error) {
-	if errors.Is(err, ErrInvitationPending) {
-		w.Header().Set("Cache-Control", "no-store")
-		w.Header().Set("Referrer-Policy", "no-referrer")
-		http.Error(w, "이미 처리 중인 초대가 있습니다. 기존 초대 링크를 사용하거나 만료 후 다시 시도해 주세요.", http.StatusConflict)
-		return
-	}
-	if errors.Is(err, ErrInvitationMailDelivery) {
-		http.Error(w, "초대는 저장했지만 메일 발송에 실패했습니다. 같은 이메일로 다시 초대해 주세요.", http.StatusBadGateway)
-		return
-	}
-	http.Error(w, "초대를 만들지 못했습니다.", http.StatusInternalServerError)
 }
 
 func validCSRF(r *http.Request, requestContext RequestContext) bool {
@@ -1156,15 +1421,21 @@ func validUUID(value string) bool {
 }
 
 func safeAttachmentName(name string) bool {
-	if len(name) == 0 || len(name) > 128 || !strings.HasPrefix(name, "namo-") || !strings.HasSuffix(strings.ToLower(name), ".html") {
+	if len(name) == 0 || len(name) > 255 || !utf8.ValidString(name) || !strings.HasSuffix(strings.ToLower(name), ".html") {
 		return false
 	}
-	for _, character := range []byte(name) {
-		if (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') ||
-			(character >= '0' && character <= '9') || character == '-' || character == '_' || character == '.' {
-			continue
+	if !strings.HasPrefix(name, "namo-") {
+		if len(name) <= len("20060102_보고서.html") || name[8] != '_' || !strings.HasSuffix(name, "보고서.html") {
+			return false
 		}
-		return false
+		if _, err := time.Parse("20060102", name[:8]); err != nil {
+			return false
+		}
+	}
+	for _, character := range name {
+		if unicode.IsControl(character) || strings.ContainsRune(`/\:*?"<>|`, character) {
+			return false
+		}
 	}
 	return true
 }
@@ -1196,6 +1467,24 @@ func canMutateReport(requestContext RequestContext) bool {
 
 func canViewAdmin(requestContext RequestContext) bool {
 	return requestContext.Role == "platform_admin"
+}
+
+// removableMembers marks every member except the caller, because a company
+// administrator must not remove itself and leave the company unmanaged.
+func removableMembers(members []MemberView, requestContext RequestContext) []MemberView {
+	if len(members) == 0 {
+		return nil
+	}
+	marked := make([]MemberView, len(members))
+	copy(marked, members)
+	for index := range marked {
+		marked[index].Removable = marked[index].UserID != "" && marked[index].UserID != requestContext.UserID
+	}
+	return marked
+}
+
+func awaitingTenant(requestContext RequestContext) bool {
+	return requestContext.UserID != "" && requestContext.TenantID == "" && requestContext.Role != "platform_admin"
 }
 
 func safeURL(value string) string {
@@ -1245,12 +1534,14 @@ func sampleNotices() []noticeView {
 		{
 			ID: "2026-sample-001", Title: "샘플: 회계감사 용역", Category: "용역", Agency: "샘플 공공기관",
 			Region: "전국", Amount: "120,000,000원", Deadline: "2026.09.08 17:00",
-			Reasons: []string{"포함 키워드 ‘회계감사’ 일치", "예정금액 5천만원 이상"},
+			Reasons:       []string{"포함 키워드 ‘회계감사’ 일치", "예정금액 5천만원 이상"},
+			FilterReasons: map[string][]string{"1": {"포함 키워드 ‘회계감사’ 일치", "예정금액 5천만원 이상"}},
 		},
 		{
 			ID: "2026-sample-002", Title: "샘플: 정보시스템 운영 지원", Category: "용역", Agency: "샘플 연구원",
 			Region: "서울", Amount: "85,000,000원", Deadline: "2026.09.10 16:00",
-			Reasons: []string{"포함 키워드 ‘운영 지원’ 일치", "지역 ‘서울’ 일치"},
+			Reasons:       []string{"포함 키워드 ‘운영 지원’ 일치", "지역 ‘서울’ 일치"},
+			FilterReasons: map[string][]string{"2": {"포함 키워드 ‘운영 지원’ 일치", "지역 ‘서울’ 일치"}},
 		},
 		{
 			ID: "2026-sample-003", Title: "샘플: 사무용 장비 구매", Category: "물품", Agency: "샘플 재단",
@@ -1260,10 +1551,18 @@ func sampleNotices() []noticeView {
 	}
 }
 
-func filterNotices(notices []noticeView, query, category, region string) []noticeView {
+func filterNotices(notices []noticeView, query, filterID, category, region string) []noticeView {
 	query = strings.ToLower(query)
 	filtered := make([]noticeView, 0, len(notices))
 	for _, notice := range notices {
+		if filterID != "" {
+			reasons, matched := notice.FilterReasons[filterID]
+			if !matched {
+				continue
+			}
+			notice.Reasons = reasons
+			notice.Keyword = notice.FilterKeywords[filterID]
+		}
 		searchable := strings.ToLower(notice.Title + " " + notice.Agency)
 		if query != "" && !strings.Contains(searchable, query) {
 			continue
@@ -1277,6 +1576,49 @@ func filterNotices(notices []noticeView, query, category, region string) []notic
 		filtered = append(filtered, notice)
 	}
 	return filtered
+}
+
+func paginateNotices(notices []noticeView, query url.Values) ([]noticeView, paginationView) {
+	pageSize := 10
+	if requested, err := strconv.Atoi(query.Get("per_page")); err == nil && (requested == 10 || requested == 20 || requested == 30) {
+		pageSize = requested
+	}
+	page := 1
+	if requested, err := strconv.Atoi(query.Get("page")); err == nil && requested > 0 {
+		page = requested
+	}
+	pages := (len(notices) + pageSize - 1) / pageSize
+	if pages == 0 {
+		page = 1
+	} else if page > pages {
+		page = pages
+	}
+	start := (page - 1) * pageSize
+	if start > len(notices) {
+		start = len(notices)
+	}
+	end := start + pageSize
+	if end > len(notices) {
+		end = len(notices)
+	}
+	view := paginationView{Page: page, Pages: pages, PageSize: pageSize, Total: len(notices)}
+	if page > 1 {
+		view.PreviousURL = noticePageURL(query, page-1, pageSize)
+	}
+	if page < pages {
+		view.NextURL = noticePageURL(query, page+1, pageSize)
+	}
+	return notices[start:end], view
+}
+
+func noticePageURL(query url.Values, page, pageSize int) string {
+	values := make(url.Values, len(query))
+	for key, items := range query {
+		values[key] = append([]string(nil), items...)
+	}
+	values.Set("page", strconv.Itoa(page))
+	values.Set("per_page", strconv.Itoa(pageSize))
+	return "/notices?" + values.Encode()
 }
 
 func matchesRegionSearch(noticeRegion, query string) bool {
@@ -1337,15 +1679,29 @@ func sampleRecipients() []recipientView {
 
 func sampleMembers() []memberView {
 	return []memberView{
-		{"김담당", "manager@example.com", "담당자"},
-		{"이관리", "admin@example.com", "테넌트 관리자"},
+		{UserID: "1f0a1f0a-0001-4a00-8000-000000000001", Name: "김담당", Email: "manager@example.com", Role: "일반 사용자", Removable: true},
+		{UserID: "1f0a1f0a-0002-4a00-8000-000000000002", Name: "이관리", Email: "admin@example.com", Role: "회사 관리자"},
 	}
 }
 
 func sampleTenants() []tenantView {
 	return []tenantView{
-		{"샘플 주식회사", 2, "오늘 07:00", "정상"},
-		{"테스트 협력사", 1, "생성 전", "점검"},
+		{Name: "샘플 주식회사", Members: 2, LastDigest: "오늘 07:00", State: "정상", AdminName: "김담당", AdminEmail: "admin@example.com", ContactMail: "contact@example.com"},
+		{Name: "테스트 협력사", Members: 1, LastDigest: "생성 전", State: "점검", AdminName: "이담당", AdminEmail: "partner@example.com", ContactMail: "partner@example.com"},
+	}
+}
+
+func sampleAccounts() []AccountView {
+	return []AccountView{
+		{UserID: "8f14e45f-ea8f-4b6d-9c1f-6b1f0a1f0001", Email: "newcomer@example.com", DisplayName: "newcomer", Created: "2026.09.03 09:12", Role: "member", RoleLabel: "일반 사용자"},
+		{UserID: "8f14e45f-ea8f-4b6d-9c1f-6b1f0a1f0002", Email: "member@example.com", DisplayName: "member", TenantID: "5f6d7e8a-1b2c-4d3e-8f90-a1b2c3d4e5f6", TenantName: "샘플 주식회사", Created: "2026.08.28 14:03", Role: "tenant_admin", RoleLabel: "회사 관리자", Assigned: true},
+	}
+}
+
+func sampleTenantOptions() []TenantOption {
+	return []TenantOption{
+		{ID: "5f6d7e8a-1b2c-4d3e-8f90-a1b2c3d4e5f6", Name: "샘플 주식회사"},
+		{ID: "6f7e8d9a-2c3b-4e5d-9f80-b2c3d4e5f6a7", Name: "테스트 협력사"},
 	}
 }
 
@@ -1371,12 +1727,14 @@ func (sampleBackend) Load(context.Context, RequestContext, PageRequest) (AppData
 			{ID: "223e4567-e89b-12d3-a456-426614174000", Trigger: "예약", Status: "재시도 대기", DueAt: "2026.09.01 07:00", GeneratedAt: "-"},
 			{ID: "323e4567-e89b-12d3-a456-426614174000", Trigger: "수동", Status: "생성 실패", DueAt: "2026.08.31 15:20", GeneratedAt: "-"},
 		},
-		Members:      sampleMembers(),
-		Tenants:      sampleTenants(),
-		DeliveryTime: "07:00",
-		DeliveryDays: []int{1, 2, 3, 4, 5},
-		Timezone:     "Asia/Seoul",
-		ContactEmail: "admin@example.com",
+		Members:       sampleMembers(),
+		Tenants:       sampleTenants(),
+		Accounts:      sampleAccounts(),
+		TenantOptions: sampleTenantOptions(),
+		DeliveryTime:  "07:00",
+		DeliveryDays:  []int{1, 2, 3, 4, 5},
+		Timezone:      "Asia/Seoul",
+		ContactEmail:  "admin@example.com",
 		Admin: AdminView{
 			Healthy:        true,
 			LastCollected:  "오늘 06:12",

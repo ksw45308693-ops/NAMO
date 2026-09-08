@@ -20,6 +20,13 @@ import (
 
 var ErrInvitationMail = appweb.ErrInvitationMailDelivery
 
+// TenantInviteInput asks for a tenant plus the invitation of its first
+// administrator. The web surface registers companies directly, so this path
+// stays available only for operator tooling.
+type TenantInviteInput struct {
+	TenantName, ContactEmail, AdminName, AdminEmail string
+}
+
 type TenantInvitationInput struct {
 	ActorUserID, TenantName, ContactEmail, AdminName, AdminEmail, TokenHash string
 	Role                                                                    auth.Role
@@ -54,7 +61,7 @@ type InvitationService struct {
 	Now           func() time.Time
 }
 
-func (s InvitationService) InviteTenant(ctx context.Context, requestContext appweb.RequestContext, command appweb.TenantInviteCommand) (appweb.InvitationResult, error) {
+func (s InvitationService) InviteTenant(ctx context.Context, requestContext appweb.RequestContext, command TenantInviteInput) (appweb.InvitationResult, error) {
 	ctx, cancel := context.WithTimeout(ctx, interactiveMailRetryPolicy.TotalTimeout)
 	defer cancel()
 

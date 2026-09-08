@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"namo/internal/report"
 )
@@ -115,7 +117,11 @@ func (r ReportRunner) runClaimed(ctx context.Context, work ReportWork) (ReportOu
 		})
 		var fileResult report.FileResult
 		if operationErr == nil {
-			fileResult, operationErr = r.Writer.Write(ctx, relativePath, body)
+			operationErr = r.Repository.WithReportClaim(ctx, work, func() error {
+				var err error
+				fileResult, err = r.Writer.Write(ctx, relativePath, body)
+				return err
+			})
 			if operationErr == nil && (filepath.Clean(fileResult.RelativePath) != filepath.Clean(relativePath) || strings.TrimSpace(fileResult.SHA256) == "") {
 				operationErr = errors.New("report writer returned an invalid artifact")
 			}
@@ -171,7 +177,50 @@ func reportRelativePath(work ReportWork) (string, error) {
 	default:
 		return "", fmt.Errorf("unsupported report trigger %q", work.Trigger)
 	}
-	return path.Join(work.TenantID, dueAt.Format("2006"), dueAt.Format("01"), name+".html"), nil
+	parent := path.Join(work.TenantID, dueAt.Format("2006"), dueAt.Format("01"))
+	legacyPath := path.Join(parent, name+".html")
+	if work.RelativePath == legacyPath {
+		return legacyPath, nil
+	}
+	name = dueAt.Format("20060102") + "_" + reportFilterLabel(work.Notices) + "보고서.html"
+	return path.Join(parent, work.ReportID, name), nil
+}
+
+func reportFilterLabel(notices []report.Notice) string {
+	name := ""
+	for _, notice := range notices {
+		for _, match := range notice.Matches {
+			candidate := strings.TrimSpace(match.RuleName)
+			if candidate == "" {
+				continue
+			}
+			if name != "" && name != candidate {
+				return "통합"
+			}
+			name = candidate
+		}
+	}
+	name = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) || strings.ContainsRune(`/\:*?"<>|`, r) {
+			return '_'
+		}
+		return r
+	}, name)
+	name = strings.Trim(name, " .")
+	var label strings.Builder
+	count := 0
+	for _, r := range name {
+		// Leave room for the date and suffix within a 255-byte filename.
+		if count == 60 || label.Len()+utf8.RuneLen(r) > 220 {
+			break
+		}
+		label.WriteRune(r)
+		count++
+	}
+	if label.Len() == 0 {
+		return "통합"
+	}
+	return label.String()
 }
 
 func safeReportPathID(value string) bool {

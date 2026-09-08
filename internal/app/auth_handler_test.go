@@ -16,15 +16,28 @@ import (
 )
 
 type identityRepoStub struct {
-	account    LoginAccount
-	accountErr error
-	sessions   map[string]SessionRecord
-	sessionErr error
-	deleteErr  error
+	account          LoginAccount
+	accountErr       error
+	lookupIdentifier string
+	sessions         map[string]SessionRecord
+	sessionErr       error
+	deleteErr        error
+	created          SignupInput
+	createCalls      int
+	createErr        error
 }
 
-func (r *identityRepoStub) AccountByEmail(context.Context, string) (LoginAccount, error) {
+func (r *identityRepoStub) AccountByEmail(_ context.Context, identifier string) (LoginAccount, error) {
+	r.lookupIdentifier = identifier
 	return r.account, r.accountErr
+}
+func (r *identityRepoStub) CreateAccount(_ context.Context, input SignupInput) (LoginAccount, error) {
+	r.createCalls++
+	r.created = input
+	if r.createErr != nil {
+		return LoginAccount{}, r.createErr
+	}
+	return LoginAccount{UserID: "11111111-2222-3333-4444-555555555555", Email: input.Email, PasswordHash: input.PasswordHash, Role: auth.Member}, nil
 }
 func (r *identityRepoStub) SaveSession(_ context.Context, session SessionRecord) error {
 	if r.sessions == nil {
@@ -150,6 +163,107 @@ func TestLoginUsesDummyBcryptForUnknownAccount(t *testing.T) {
 	handler.ServeHTTP(response, request)
 	if response.Code != http.StatusUnauthorized || checks != 1 {
 		t.Fatalf("status=%d checks=%d body=%q", response.Code, checks, response.Body.String())
+	}
+}
+
+func TestLoginRejectsInvalidIdentifierBeforeAuthentication(t *testing.T) {
+	passwordHash, err := auth.HashPassword("correct horse battery staple")
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo := &identityRepoStub{account: LoginAccount{
+		UserID: "admin-1", Email: "admin", PasswordHash: passwordHash, Role: auth.PlatformAdmin,
+	}}
+	handler, err := NewAuthHandler(http.NotFoundHandler(), repo, []byte("01234567890123456789012345678901"), true, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	page := httptest.NewRecorder()
+	handler.ServeHTTP(page, httptest.NewRequest(http.MethodGet, "/login", nil))
+	var cookie *http.Cookie
+	for _, candidate := range page.Result().Cookies() {
+		if candidate.Name == LoginCSRFCookieName {
+			cookie = candidate
+		}
+	}
+	if cookie == nil {
+		t.Fatal("login CSRF cookie missing")
+	}
+	token, ok := handler.(*authHandler).loginCSRFToken(requestWithCookie(cookie))
+	if !ok {
+		t.Fatal("login CSRF token could not be decoded")
+	}
+	form := url.Values{"email": {"admin name"}, "password": {"correct horse battery staple"}, "_csrf": {token}}
+	request := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(cookie)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("status=%d, want 401", response.Code)
+	}
+}
+
+func TestLoginAcceptsNormalizedPlatformUsername(t *testing.T) {
+	passwordHash, err := auth.HashPassword("correct horse battery staple")
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo := &identityRepoStub{account: LoginAccount{
+		UserID: "admin-1", Email: "admin", PasswordHash: passwordHash, Role: auth.PlatformAdmin,
+	}}
+	handler, err := NewAuthHandler(http.NotFoundHandler(), repo, []byte("01234567890123456789012345678901"), true, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	page := httptest.NewRecorder()
+	handler.ServeHTTP(page, httptest.NewRequest(http.MethodGet, "/login", nil))
+	var cookie *http.Cookie
+	for _, candidate := range page.Result().Cookies() {
+		if candidate.Name == LoginCSRFCookieName {
+			cookie = candidate
+		}
+	}
+	if cookie == nil {
+		t.Fatal("login CSRF cookie missing")
+	}
+	token, ok := handler.(*authHandler).loginCSRFToken(requestWithCookie(cookie))
+	if !ok {
+		t.Fatal("login CSRF token could not be decoded")
+	}
+	form := url.Values{"email": {" Admin "}, "password": {"correct horse battery staple"}, "_csrf": {token}}
+	request := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(cookie)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusSeeOther || repo.lookupIdentifier != "admin" || len(repo.sessions) != 1 {
+		t.Fatalf("status=%d identifier=%q sessions=%d", response.Code, repo.lookupIdentifier, len(repo.sessions))
+	}
+}
+
+func TestNormalizeLoginIdentifierAcceptsEmailAndPlatformUsername(t *testing.T) {
+	tests := []struct {
+		raw, want string
+		valid     bool
+	}{
+		{raw: " Admin ", want: "admin", valid: true},
+		{raw: " User@Example.COM ", want: "user@example.com", valid: true},
+		{raw: "ab", valid: false},
+		{raw: "admin name", valid: false},
+		{raw: "admin@example", want: "admin@example", valid: true},
+		{raw: "admin@ example", valid: false},
+	}
+	for _, tt := range tests {
+		got, err := normalizeLoginIdentifier(tt.raw)
+		if tt.valid && (err != nil || got != tt.want) {
+			t.Fatalf("normalizeLoginIdentifier(%q) = %q, %v; want %q", tt.raw, got, err, tt.want)
+		}
+		if !tt.valid && err == nil {
+			t.Fatalf("normalizeLoginIdentifier(%q) = %q; want error", tt.raw, got)
+		}
 	}
 }
 

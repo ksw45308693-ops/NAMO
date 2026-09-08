@@ -176,7 +176,7 @@ func parseCreateAdminOptions(args []string, input io.Reader, openFile func(strin
 	var options CreateAdminOptions
 	var passwordFile string
 	var passwordStdin bool
-	set.StringVar(&options.Email, "email", "", "administrator email")
+	set.StringVar(&options.Email, "email", "", "administrator email or username")
 	set.StringVar(&options.DisplayName, "name", "", "administrator display name")
 	set.StringVar(&passwordFile, "password-file", "", "read password from file")
 	set.BoolVar(&passwordStdin, "password-stdin", false, "read password from stdin")
@@ -186,9 +186,9 @@ func parseCreateAdminOptions(args []string, input io.Reader, openFile func(strin
 	if set.NArg() != 0 {
 		return CreateAdminOptions{}, "", errors.New("create-admin does not accept positional arguments")
 	}
-	email, err := normalizeMailbox(options.Email)
+	email, err := normalizeLoginIdentifier(options.Email)
 	if err != nil {
-		return CreateAdminOptions{}, "", fmt.Errorf("email: %w", err)
+		return CreateAdminOptions{}, "", fmt.Errorf("login: %w", err)
 	}
 	options.Email = email
 	options.DisplayName = strings.TrimSpace(options.DisplayName)
@@ -301,17 +301,31 @@ func defaultCollectionRunnerFactory(repository *PostgresRepository, cfg config.C
 		return nil, errors.New("PostgreSQL collector repository is not available")
 	}
 	callBudget := &PostgresDailyCallBudget{DB: repository.Pool}
-	job := CollectionJob{
-		Acquire: func(ctx context.Context) (AdvisorySession, error) {
-			return repository.Pool.Acquire(ctx)
-		},
-		Run: func(ctx context.Context) (CollectionResult, error) {
-			// The region cache is per collection window. The PostgreSQL budget is
-			// shared by every process and retry for the current Seoul calendar day.
-			return runCollector(ctx, repository, cfg, callBudget)
-		},
+	return collectionWithAPIKey(cfg, func(ctx context.Context, current config.Config) (CollectionResult, error) {
+		job := CollectionJob{
+			Acquire: func(ctx context.Context) (AdvisorySession, error) {
+				return repository.Pool.Acquire(ctx)
+			},
+			Run: func(ctx context.Context) (CollectionResult, error) {
+				// The region cache is per collection window. The PostgreSQL budget is
+				// shared by every process and retry for the current Seoul calendar day.
+				return runCollector(ctx, repository, current, callBudget)
+			},
+		}
+		return job.RunLocked(ctx)
+	}), nil
+}
+
+func collectionWithAPIKey(cfg config.Config, run func(context.Context, config.Config) (CollectionResult, error)) CollectionRunner {
+	return func(ctx context.Context) (CollectionResult, error) {
+		key, err := cfg.APIKeys().Read()
+		if err != nil {
+			return CollectionResult{}, err
+		}
+		current := cfg
+		current.G2BAPIKey = key
+		return run(ctx, current)
 	}
-	return job.RunLocked, nil
 }
 
 func (r *Runtime) sendTestMail(ctx context.Context, cfg config.Config, args []string) error {
@@ -437,6 +451,24 @@ func normalizeMailbox(raw string) (string, error) {
 	return strings.ToLower(address.Address), nil
 }
 
+func normalizeLoginIdentifier(raw string) (string, error) {
+	value := strings.ToLower(strings.TrimSpace(raw))
+	if email, err := normalizeMailbox(value); err == nil && len(email) <= 320 {
+		return email, nil
+	}
+	if len(value) < 3 || len(value) > 64 {
+		return "", errors.New("an email address or 3-64 character username is required")
+	}
+	for index := 0; index < len(value); index++ {
+		character := value[index]
+		letterOrDigit := character >= 'a' && character <= 'z' || character >= '0' && character <= '9'
+		if !letterOrDigit && (index == 0 || character != '.' && character != '_' && character != '-') {
+			return "", errors.New("an email address or 3-64 character username is required")
+		}
+	}
+	return value, nil
+}
+
 func sendTestMail(ctx context.Context, mailer Mailer, from, to string) error {
 	return sendTestMailWithPolicy(ctx, mailer, from, to, interactiveMailRetryPolicy)
 }
@@ -503,6 +535,9 @@ func newServeScheduler(collectionRunner CollectionRunner, reportJob ScheduledJob
 	return jobs.NewScheduler(time.Hour,
 		func(jobCtx context.Context, _ time.Time) error {
 			_, err := collectionRunner(jobCtx)
+			if errors.Is(err, config.ErrAPIKeyNotConfigured) {
+				return nil
+			}
 			return err
 		},
 		jobs.Job(reportJob),
@@ -580,9 +615,11 @@ func defaultUIFactory(ctx context.Context, repository *PostgresRepository, store
 		QueueCollection: collectionTrigger.Trigger,
 		ReportStore:     store,
 		ReportDir:       cfg.ReportDir,
+		APIKeys:         cfg.APIKeys(),
 	}
 	return webui.NewHandlerWithOptions(webui.Options{
 		Backend: service, Actions: service, MapContext: service.MapRequest,
+		SaveAPIKey: service.SaveG2BAPIKey,
 	})
 }
 

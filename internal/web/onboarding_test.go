@@ -4,33 +4,16 @@ import (
 	"context"
 	"errors"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 )
 
 type recordingOnboarding struct {
-	tenantCalls, memberCalls, lookupCalls, acceptCalls int
-	tenantContext, memberContext                       RequestContext
-	tenantCommand                                      TenantInviteCommand
-	memberCommand                                      MemberInviteCommand
-	acceptCommand                                      AcceptInviteCommand
-	invitation                                         InvitationView
-	result                                             InvitationResult
-	err                                                error
-}
-
-func (o *recordingOnboarding) InviteTenant(_ context.Context, requestContext RequestContext, command TenantInviteCommand) (InvitationResult, error) {
-	o.tenantCalls++
-	o.tenantContext, o.tenantCommand = requestContext, command
-	return o.result, o.err
-}
-
-func (o *recordingOnboarding) InviteMember(_ context.Context, requestContext RequestContext, command MemberInviteCommand) (InvitationResult, error) {
-	o.memberCalls++
-	o.memberContext, o.memberCommand = requestContext, command
-	return o.result, o.err
+	lookupCalls, acceptCalls int
+	acceptCommand            AcceptInviteCommand
+	invitation               InvitationView
+	err                      error
 }
 
 func (o *recordingOnboarding) Invitation(context.Context, string) (InvitationView, error) {
@@ -44,84 +27,6 @@ func (o *recordingOnboarding) AcceptInvitation(_ context.Context, command Accept
 	return o.err
 }
 
-func TestInviteTenantRequiresRoleAndCSRF(t *testing.T) {
-	form := "_csrf=token&tenant_name=새회사&contact_email=contact%40example.com&admin_name=김관리&admin_email=admin%40example.com"
-	link := "https://monitor.example/accept-invite#token=" + strings.Repeat("t", 43)
-
-	allowed := &recordingOnboarding{result: InvitationResult{URL: link, ExpiresAt: time.Date(2026, 9, 4, 8, 0, 0, 0, time.UTC)}}
-	response := serveHandler(t, onboardingHandler(t, RequestContext{UserID: "platform-1", Role: "platform_admin", CSRFToken: "token"}, allowed), http.MethodPost, "/admin/tenants", form)
-	if response.Code != http.StatusOK || response.Header().Get("Location") != "" || allowed.tenantCalls != 1 {
-		t.Fatalf("allowed status=%d location=%q calls=%d body=%q", response.Code, response.Header().Get("Location"), allowed.tenantCalls, response.Body.String())
-	}
-	assertInvitationLinkResponse(t, response, link)
-	if allowed.tenantCommand.AdminEmail != "admin@example.com" || allowed.tenantContext.UserID != "platform-1" {
-		t.Fatalf("tenant invite=%#v context=%#v", allowed.tenantCommand, allowed.tenantContext)
-	}
-
-	for _, test := range []struct {
-		name    string
-		context RequestContext
-		form    string
-		want    int
-	}{
-		{"wrong role", RequestContext{UserID: "member", TenantID: "tenant-1", Role: "member", CSRFToken: "token"}, form, http.StatusForbidden},
-		{"bad csrf", RequestContext{UserID: "platform-1", Role: "platform_admin", CSRFToken: "token"}, strings.Replace(form, "_csrf=token", "_csrf=wrong", 1), http.StatusForbidden},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			onboarding := &recordingOnboarding{}
-			got := serveHandler(t, onboardingHandler(t, test.context, onboarding), http.MethodPost, "/admin/tenants", test.form)
-			if got.Code != test.want || onboarding.tenantCalls != 0 {
-				t.Fatalf("status=%d calls=%d", got.Code, onboarding.tenantCalls)
-			}
-		})
-	}
-}
-
-func TestInviteMemberCannotChooseAnotherTenant(t *testing.T) {
-	link := "https://monitor.example/accept-invite#token=" + strings.Repeat("m", 43)
-	onboarding := &recordingOnboarding{result: InvitationResult{URL: link, ExpiresAt: time.Date(2026, 9, 4, 8, 0, 0, 0, time.UTC)}}
-	requestContext := RequestContext{UserID: "admin-1", TenantID: "tenant-real", TenantName: "실제 회사", Role: "tenant_admin", CSRFToken: "token"}
-	form := "_csrf=token&tenant_id=tenant-other&name=새담당&email=new%40example.com&role=tenant_admin"
-	response := serveHandler(t, onboardingHandler(t, requestContext, onboarding), http.MethodPost, "/settings/invitations", form)
-	if response.Code != http.StatusOK || response.Header().Get("Location") != "" || onboarding.memberCalls != 1 {
-		t.Fatalf("status=%d location=%q calls=%d", response.Code, response.Header().Get("Location"), onboarding.memberCalls)
-	}
-	assertInvitationLinkResponse(t, response, link)
-	if onboarding.memberContext.TenantID != "tenant-real" || onboarding.memberCommand.Role != "tenant_admin" {
-		t.Fatalf("context=%#v command=%#v", onboarding.memberContext, onboarding.memberCommand)
-	}
-
-	for _, role := range []string{"member", "platform_admin"} {
-		restricted := &recordingOnboarding{}
-		ctx := RequestContext{UserID: "user", TenantID: "tenant-real", Role: role, CSRFToken: "token"}
-		got := serveHandler(t, onboardingHandler(t, ctx, restricted), http.MethodPost, "/settings/invitations", form)
-		if got.Code != http.StatusForbidden || restricted.memberCalls != 0 {
-			t.Fatalf("role=%s status=%d calls=%d", role, got.Code, restricted.memberCalls)
-		}
-	}
-}
-
-func TestInviteLinkIsOnlyRenderedForSuccessfulPost(t *testing.T) {
-	link := "https://monitor.example/accept-invite#token=" + strings.Repeat("s", 43)
-	onboarding := &recordingOnboarding{result: InvitationResult{URL: link, ExpiresAt: time.Date(2026, 9, 4, 8, 0, 0, 0, time.UTC)}}
-	handler := onboardingHandler(t, RequestContext{UserID: "admin-1", TenantID: "tenant-1", TenantName: "회사", Role: "tenant_admin", CSRFToken: "token"}, onboarding)
-
-	post := serveHandler(t, handler, http.MethodPost, "/settings/invitations", "_csrf=token&name=담당자&email=user%40example.com&role=member")
-	assertInvitationLinkResponse(t, post, link)
-	onboarding.err = ErrInvitationPending
-	replayed := serveHandler(t, handler, http.MethodPost, "/settings/invitations", "_csrf=token&name=담당자&email=user%40example.com&role=member")
-	if replayed.Code != http.StatusConflict || strings.Contains(replayed.Body.String(), "#token=") || strings.Contains(replayed.Body.String(), strings.Repeat("s", 43)) {
-		t.Fatalf("replay status=%d body=%q", replayed.Code, replayed.Body.String())
-	}
-	if replayed.Header().Get("Cache-Control") != "no-store" || replayed.Header().Get("Referrer-Policy") != "no-referrer" || replayed.Header().Get("Set-Cookie") != "" || replayed.Header().Get("Location") != "" {
-		t.Fatalf("replay sensitive headers=%v", replayed.Header())
-	}
-	get := serveHandler(t, handler, http.MethodGet, "/settings", "")
-	if strings.Contains(get.Body.String(), link) || strings.Contains(get.Body.String(), "#token=") {
-		t.Fatalf("invitation link leaked into a later GET: %s", get.Body.String())
-	}
-}
-
 func TestPublicInvitationPageAndAcceptance(t *testing.T) {
 	token := strings.Repeat("a", 43)
 	onboarding := &recordingOnboarding{invitation: InvitationView{
@@ -130,7 +35,7 @@ func TestPublicInvitationPageAndAcceptance(t *testing.T) {
 	}}
 	handler := onboardingHandler(t, RequestContext{CSRFToken: "anonymous-token"}, onboarding)
 	bootstrap := serveHandler(t, handler, http.MethodGet, "/accept-invite", "")
-	if bootstrap.Code != http.StatusOK || !strings.Contains(bootstrap.Body.String(), `data-invite-token-form`) || !strings.Contains(bootstrap.Body.String(), `/assets/app.js?v=2`) || onboarding.lookupCalls != 0 {
+	if bootstrap.Code != http.StatusOK || !strings.Contains(bootstrap.Body.String(), `data-invite-token-form`) || !strings.Contains(bootstrap.Body.String(), `/assets/app.js?v=3`) || onboarding.lookupCalls != 0 {
 		t.Fatalf("bootstrap status=%d lookup=%d body=%q", bootstrap.Code, onboarding.lookupCalls, bootstrap.Body.String())
 	}
 	page := serveHandler(t, handler, http.MethodPost, "/accept-invite", "_csrf=anonymous-token&mode=inspect&token="+token)
@@ -213,15 +118,6 @@ func onboardingHandler(t *testing.T, requestContext RequestContext, onboarding O
 	return handler
 }
 
-func TestInviteMailFailureExplainsSafeReinvite(t *testing.T) {
-	onboarding := &recordingOnboarding{err: ErrInvitationMailDelivery}
-	ctx := RequestContext{UserID: "admin", TenantID: "tenant-1", Role: "tenant_admin", CSRFToken: "token"}
-	response := serveHandler(t, onboardingHandler(t, ctx, onboarding), http.MethodPost, "/settings/invitations", "_csrf=token&name=담당자&email=user%40example.com&role=member")
-	if response.Code != http.StatusBadGateway || !strings.Contains(response.Body.String(), "같은 이메일로 다시 초대") {
-		t.Fatalf("status=%d body=%q", response.Code, response.Body.String())
-	}
-}
-
 func TestInvitationBootstrapMovesFragmentTokenIntoPostBody(t *testing.T) {
 	body := serve(t, http.MethodGet, "/assets/app.js").Body.String()
 	for _, want := range []string{"data-invite-token-form", "window.location.hash", "history.replaceState", "requestSubmit"} {
@@ -229,29 +125,10 @@ func TestInvitationBootstrapMovesFragmentTokenIntoPostBody(t *testing.T) {
 			t.Fatalf("invitation bootstrap script missing %q", want)
 		}
 	}
-	for _, want := range []string{"data-copy-invitation", "navigator.clipboard.writeText", ".select()"} {
+	// Destructive company and account removals confirm in the browser first.
+	for _, want := range []string{"form[data-confirm]", "window.confirm", "event.preventDefault()"} {
 		if !strings.Contains(body, want) {
-			t.Fatalf("invitation copy fallback script missing %q", want)
-		}
-	}
-}
-
-func assertInvitationLinkResponse(t *testing.T, response *httptest.ResponseRecorder, link string) {
-	t.Helper()
-	body := response.Body.String()
-	if response.Code != http.StatusOK || response.Header().Get("Cache-Control") != "no-store" || response.Header().Get("Referrer-Policy") != "no-referrer" {
-		t.Fatalf("status=%d sensitive headers=%v body=%q", response.Code, response.Header(), body)
-	}
-	if strings.Count(body, link) != 1 || !strings.Contains(body, "readonly") || !strings.Contains(body, "data-copy-invitation") {
-		t.Fatalf("one-time readonly invitation link missing or repeated: %s", body)
-	}
-	if response.Header().Get("Location") != "" || response.Header().Get("Set-Cookie") != "" {
-		t.Fatalf("invitation escaped through redirect or cookie: %v", response.Header())
-	}
-	rawToken := strings.TrimPrefix(link, "https://monitor.example/accept-invite#token=")
-	for name, values := range response.Header() {
-		if strings.Contains(strings.Join(values, "\n"), rawToken) {
-			t.Fatalf("raw invitation token leaked through %s header", name)
+			t.Fatalf("removal confirmation script missing %q", want)
 		}
 	}
 }

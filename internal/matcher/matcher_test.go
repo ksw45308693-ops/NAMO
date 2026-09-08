@@ -101,6 +101,26 @@ func TestMatchAtRejectsInvalidDeadlineAndAmountBoundary(t *testing.T) {
 	}
 }
 
+func TestUnlimitedDeadlineRuleMatchesNoticeWithoutDeadline(t *testing.T) {
+	now := time.Date(2026, 9, 4, 9, 0, 0, 0, time.UTC)
+	result := MatchAt(now, model.Notice{Title: "데이터 구축 용역"}, Rule{IncludeAny: []string{"데이터"}})
+	if !result.Matched {
+		t.Fatalf("notice without deadline was dropped: %+v", result)
+	}
+}
+
+func TestDeadlineWindowRuleDropsNoticeWithoutDeadline(t *testing.T) {
+	now := time.Date(2026, 9, 4, 9, 0, 0, 0, time.UTC)
+	days := 3
+	result := MatchAt(now, model.Notice{Title: "데이터 구축 용역"}, Rule{IncludeAny: []string{"데이터"}, DeadlineWithinDays: &days})
+	if result.Matched {
+		t.Fatal("notice without deadline slipped through a deadline window rule")
+	}
+	if len(result.Reasons) != 1 || result.Reasons[0] != ReasonInvalidDeadline {
+		t.Fatalf("unexpected reasons: %+v", result.Reasons)
+	}
+}
+
 func hasReason(reasons []Reason, want Reason) bool {
 	for _, reason := range reasons {
 		if reason == want {

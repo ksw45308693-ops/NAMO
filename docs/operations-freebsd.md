@@ -22,7 +22,7 @@ TLS는 Nginx가 종료하고 Go 서비스 포트는 외부 인터페이스에 �
 
 ```sh
 export DATABASE_URL='postgres://namo_app:change-runtime-password@127.0.0.1/namo?sslmode=disable'
-export G2B_API_KEY='replace-with-data-go-kr-service-key'
+export G2B_API_KEY_FILE='/var/db/namo/secrets/g2b-api-key'
 export DELIVERY_MODE='report'
 export REPORT_DIR='/var/db/namo/reports'
 export BASE_URL='https://namo.example.internal'
@@ -32,6 +32,19 @@ export TIME_ZONE='Asia/Seoul'
 ```
 
 ## 초기화와 실행
+
+API 키는 배포 중 입력하지 않는다. 앱 시작 후 플랫폼 관리자로 로그인하여
+**환경 설정 → 나라장터 API 키**에 Encoding 또는 Decoding 인증키를 그대로 붙여넣어 저장한다.
+Encoding 키는 앱에서 한 번 디코딩한다. 사용자가 `%2B`, `%2F`, `%3D`를 직접 바꾸지 않는다.
+키가 없으면 공고 수집만 대기한다. 저장 후 재시작은 필요하지 않으며,
+**플랫폼 관리 → 수집 1회 실행**으로 실제 API 인증을 확인한다.
+
+업데이트할 때는 실행 파일과 `deploy/freebsd/namo.in`을 함께 교체한다.
+새 서비스 스크립트가 기본 `/var/db/namo/secrets`를 서비스 계정 소유, `0700`으로 준비한다.
+사용자 지정 `G2B_API_KEY_FILE` 경로의 부모는 운영자가 미리 준비한다.
+파일이 없을 때만 기존 `G2B_API_KEY`가 사용되며, 웹에서 저장한 키가 우선한다.
+키 파일은 `0600`이고 저장된 키는 화면에 다시 표시하지 않는다.
+DB·리포트 백업은 키 파일을 포함하지 않으므로 복구 뒤 웹에서 다시 등록한다.
 
 PostgreSQL 관리자 셸에서 DB를 먼저 만든다. 현재 마이그레이션은 `BYPASSRLS` 보조 역할을
 생성·고정하고 해당 `NOLOGIN` 역할 소유 함수를 교체한다. 따라서 `MIGRATION_DATABASE_URL`에는

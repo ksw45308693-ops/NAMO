@@ -5,6 +5,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"io/fs"
+	"path"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -26,6 +29,44 @@ type reportRepositoryFake struct {
 	finalizeCalls   []ReportWork
 	finalizeErrors  []error
 	failureAttempts []int
+	publishErr      error
+}
+
+func (f *reportRepositoryFake) WithReportClaim(_ context.Context, _ ReportWork, publish func() error) error {
+	if f.publishErr != nil {
+		return f.publishErr
+	}
+	return publish()
+}
+
+func TestStaleReportWorkerCannotRecreateDeletedFile(t *testing.T) {
+	store, err := report.OpenFileStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	work := scheduledReportWork(1)
+	name, err := reportRelativePath(work)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Write(context.Background(), name, []byte("completed by replacement worker")); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Remove(context.Background(), name); err != nil {
+		t.Fatal(err)
+	}
+	repo := &reportRepositoryFake{due: []ReportWork{work}, publishErr: errors.New("claim no longer owned")}
+	_, err = (ReportRunner{Repository: repo, Writer: store}).Run(context.Background())
+	if err == nil {
+		t.Fatal("stale worker succeeded")
+	}
+	if file, _, err := store.Open(name); !errors.Is(err, fs.ErrNotExist) {
+		if file != nil {
+			file.Close()
+		}
+		t.Fatalf("stale worker recreated deleted report: %v", err)
+	}
 }
 
 func (f *reportRepositoryFake) ClaimDueReports(context.Context, time.Time) ([]ReportWork, error) {
@@ -132,7 +173,7 @@ func TestReportRunnerWritesDeterministicScheduledPathAndFinalizes(t *testing.T) 
 	if result.Generated != 1 || result.Failed != 0 || len(result.TenantRuns) != 1 {
 		t.Fatalf("result=%+v", result)
 	}
-	wantPath := "tenant-1/2026/09/namo-20260903-000405.html"
+	wantPath := "tenant-1/2026/09/report-1/20260903_통합보고서.html"
 	if writer.calls != 1 || writer.paths[0] != wantPath {
 		t.Fatalf("writes=%d paths=%q", writer.calls, writer.paths)
 	}
@@ -231,7 +272,7 @@ func TestReportRunnerManualAndAdministratorRetryReuseFixedReport(t *testing.T) {
 	if err != nil || !outcome.Created || outcome.ID != "report-2" {
 		t.Fatalf("manual outcome=%+v err=%v", outcome, err)
 	}
-	wantPath := "tenant-1/2026/09/namo-20260903-000405-report-2.html"
+	wantPath := "tenant-1/2026/09/report-2/20260903_통합보고서.html"
 	if outcome.RelativePath != wantPath {
 		t.Fatalf("manual path=%q", outcome.RelativePath)
 	}
@@ -245,6 +286,91 @@ func TestReportRunnerManualAndAdministratorRetryReuseFixedReport(t *testing.T) {
 	for _, body := range writer.bodies[1:] {
 		if !strings.Contains(string(body), "회계감사 용역") {
 			t.Fatalf("administrator retry did not reuse fixed items: %s", body)
+		}
+	}
+}
+
+func TestReportFileNamesUseSnapshotFiltersAndKoreanDate(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		filters []string
+		want    string
+	}{
+		{"single", []string{"데이터"}, "20260907_데이터보고서.html"},
+		{"repeated", []string{"데이터", "데이터"}, "20260907_데이터보고서.html"},
+		{"multiple", []string{"데이터", "회계"}, "20260907_통합보고서.html"},
+		{"missing", nil, "20260907_통합보고서.html"},
+		{"blank", []string{"  ", "..."}, "20260907_통합보고서.html"},
+		{"trimmed", []string{" 데이터 ", "데이터"}, "20260907_데이터보고서.html"},
+		{"unsafe", []string{"../데이터\\분석:*?\"<>|\n"}, "20260907__데이터_분석_______보고서.html"},
+		{"long", []string{strings.Repeat("가", 100)}, "20260907_" + strings.Repeat("가", 60) + "보고서.html"},
+		{"long unicode", []string{strings.Repeat("😀", 100)}, "20260907_" + strings.Repeat("😀", 55) + "보고서.html"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			work := scheduledReportWork(1)
+			work.DueAt = time.Date(2026, 9, 6, 15, 0, 0, 0, time.UTC)
+			work.Notices = nil
+			for _, name := range tt.filters {
+				work.Notices = append(work.Notices, report.Notice{Matches: []report.Match{{RuleName: name}}})
+			}
+			for _, trigger := range []string{"manual", "scheduled"} {
+				work.Trigger = trigger
+				got, err := reportRelativePath(work)
+				if err != nil || path.Base(got) != tt.want || path.Dir(got) != "tenant-1/2026/09/report-1" {
+					t.Fatalf("%s path=%q err=%v want filename=%q", trigger, got, err, tt.want)
+				}
+			}
+		})
+	}
+}
+
+func TestSameDateReportsKeepSeparateFilesAndRetryPath(t *testing.T) {
+	store, err := report.OpenFileStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	first := scheduledReportWork(1)
+	first.Notices[0].Matches = []report.Match{{RuleName: "데이터"}}
+	second := first
+	second.ReportID = "report-2"
+	second.Notices = append([]report.Notice(nil), first.Notices...)
+	second.Notices[0].Title = "다른 공고"
+	repository := &reportRepositoryFake{due: []ReportWork{first, second}}
+	runner := ReportRunner{Repository: repository, Writer: store}
+	result, err := runner.Run(context.Background())
+	if err != nil || result.Generated != 2 {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	for _, work := range repository.finalizeCalls {
+		file, _, err := store.Open(work.RelativePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		file.Close()
+		if filepath.Base(work.RelativePath) != "20260903_데이터보고서.html" {
+			t.Fatal(work.RelativePath)
+		}
+	}
+	repository.retry, repository.retryClaimed = repository.finalizeCalls[0], true
+	outcome, err := runner.Retry(context.Background(), first.TenantID, first.ReportID)
+	if err != nil || !outcome.Created || outcome.RelativePath != repository.retry.RelativePath {
+		t.Fatalf("retry=%+v err=%v", outcome, err)
+	}
+}
+
+func TestRetryKeepsAlreadyStoredLegacyReportPath(t *testing.T) {
+	for _, trigger := range []string{"scheduled", "manual"} {
+		work := scheduledReportWork(1)
+		work.Trigger = trigger
+		work.RelativePath = "tenant-1/2026/09/namo-20260903-000405"
+		if trigger == "manual" {
+			work.RelativePath += "-report-1"
+		}
+		work.RelativePath += ".html"
+		got, err := reportRelativePath(work)
+		if err != nil || got != work.RelativePath {
+			t.Fatalf("path=%q err=%v", got, err)
 		}
 	}
 }

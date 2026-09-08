@@ -41,7 +41,7 @@ func TestFreeBSDLogRotationAndBackupContracts(t *testing.T) {
 		`*//*|*/./*|*/.|*/../*|*/..|*/)`,
 		`[ -L "$report_path_component" ]`,
 		`install -d -o root -g "$namo_run_group" -m 0750 "$report_parent"`,
-		`install -d -o namo -g namo -m 0750 "$REPORT_DIR"`,
+		`install -d -o "$namo_run_user" -g "$namo_run_group" -m 0750 "$REPORT_DIR"`,
 	} {
 		if !strings.Contains(rc, want) {
 			t.Errorf("rc.d report directory contract missing %q", want)
@@ -53,9 +53,9 @@ func TestFreeBSDLogRotationAndBackupContracts(t *testing.T) {
 		}
 	}
 	envSource := strings.Index(rc, `. "$namo_env_file"`)
-	reportValidation := strings.LastIndex(rc, "namo_validate_report_dir")
+	reportValidation := strings.Index(rc, "\tnamo_validate_report_dir || return 1")
 	parentInstall := strings.Index(rc, `install -d -o root -g "$namo_run_group" -m 0750 "$report_parent"`)
-	reportInstall := strings.Index(rc, `install -d -o namo -g namo -m 0750 "$REPORT_DIR"`)
+	reportInstall := strings.Index(rc, `install -d -o "$namo_run_user" -g "$namo_run_group" -m 0750 "$REPORT_DIR"`)
 	pidInstall := strings.Index(rc, `install -o "$namo_run_user" -g "$namo_run_group" -m 0600 /dev/null "$pidfile"`)
 	if envSource < 0 || reportValidation < envSource || parentInstall < reportValidation || reportInstall < parentInstall || pidInstall < reportInstall {
 		t.Error("rc.d must load the environment, validate REPORT_DIR, then prepare parent, report, PID, and log paths")
@@ -160,6 +160,14 @@ func TestNginxLimitsLoginPostsWithoutThrottlingLoginPage(t *testing.T) {
 	for _, want := range []string{"location = /login", "limit_req zone=namo_login", "limit_req_status 429"} {
 		if !strings.Contains(serverConfig, want) {
 			t.Errorf("Nginx server login limit config missing %q", want)
+		}
+	}
+	// Both public password-hashing endpoints must select a limited location,
+	// rather than falling through to the unrestricted application proxy.
+	for _, route := range []string{"/login", "/signup"} {
+		location := regexp.MustCompile(`(?s)location\s+=\s+` + regexp.QuoteMeta(route) + `\s*\{([^}]+)\}`).FindStringSubmatch(serverConfig)
+		if len(location) != 2 || !strings.Contains(location[1], "limit_req zone=namo_login") || !strings.Contains(location[1], "limit_req_status 429") || !strings.Contains(location[1], "proxy_pass") {
+			t.Errorf("POST %s is not routed through the authentication request limit", route)
 		}
 	}
 	operations := read("docs/operations-freebsd.md")

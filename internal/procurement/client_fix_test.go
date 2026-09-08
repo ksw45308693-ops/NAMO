@@ -3,6 +3,7 @@ package procurement
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,6 +12,33 @@ import (
 
 	"namo/internal/model"
 )
+
+func TestRegionLookupRejectsIncompleteResultAndRetriesWithoutCaching(t *testing.T) {
+	for _, items := range []string{`[]`, `[{"prtcptPsblRgnNm":"서울"}]`} {
+		t.Run(items, func(t *testing.T) {
+			calls := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				body := items
+				if calls > 1 {
+					body = `[{"prtcptPsblRgnNm":"서울"},{"prtcptPsblRgnNm":"부산"}]`
+				}
+				fmt.Fprintf(w, `{"response":{"header":{"resultCode":"00"},"body":{"totalCount":2,"items":%s}}}`, body)
+			}))
+			defer server.Close()
+			client := NewClient(Config{BaseURL: server.URL})
+			region, err := client.LookupRegion(context.Background(), "N-1", "00")
+			var incomplete *IncompletePageError
+			if !errors.As(err, &incomplete) || region != "" {
+				t.Fatalf("incomplete region was accepted: region=%q err=%v", region, err)
+			}
+			region, err = client.LookupRegion(context.Background(), "N-1", "00")
+			if err != nil || region != "부산, 서울" || calls != 2 {
+				t.Fatalf("retry region=%q calls=%d err=%v", region, calls, err)
+			}
+		})
+	}
+}
 
 func TestNewClientUsesOfficialBaseAndRejectsEncodedServiceKey(t *testing.T) {
 	if got := NewClient(Config{}).config.BaseURL; got != OfficialBaseURL {

@@ -414,6 +414,11 @@ func (c *Client) fetchRegion(ctx context.Context, bidNumber, bidSequence string)
 	if err != nil {
 		return "", err
 	}
+	total := int(payload.Response.Body.TotalCount)
+	expected := min(total, regionPageSize)
+	if len(items) < expected {
+		return "", &IncompletePageError{Page: 1, Expected: expected, Received: len(items), TotalCount: total}
+	}
 	var regions []string
 	for _, raw := range items {
 		var item struct {

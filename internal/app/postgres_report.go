@@ -11,10 +11,31 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"namo/internal/matcher"
 	"namo/internal/report"
 )
 
 var _ ReportRepository = (*PostgresRepository)(nil)
+
+// WithReportClaim serializes file publication with reclaim and deletion. The
+// claim is checked under the same row lock deletion takes before removing files.
+func (r *PostgresRepository) WithReportClaim(ctx context.Context, work ReportWork, publish func() error) error {
+	return r.withTenant(ctx, work.TenantID, func(tx pgx.Tx) error {
+		return withReportClaim(ctx, tx, work, publish)
+	})
+}
+
+func withReportClaim(ctx context.Context, tx reportStore, work ReportWork, publish func() error) error {
+	var id string
+	err := tx.QueryRow(ctx, `SELECT id::text FROM public.reports
+WHERE tenant_id=$1::uuid AND id=$2::uuid AND claim_token=$3::uuid
+  AND status='generating' AND deleted_at IS NULL
+FOR UPDATE`, work.TenantID, work.ReportID, work.ClaimToken).Scan(&id)
+	if err != nil {
+		return fmt.Errorf("lock active report claim: %w", err)
+	}
+	return publish()
+}
 
 type reportStore interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
@@ -41,7 +62,7 @@ func (r *PostgresRepository) ClaimDueReports(ctx context.Context, now time.Time)
 	var works []ReportWork
 	for _, tenant := range tenants {
 		err := r.withTenant(ctx, tenant.ID, func(tx pgx.Tx) error {
-			if _, err := tx.Exec(ctx, `SELECT pg_catalog.pg_advisory_xact_lock($1)`, collectionAdvisoryLock); err != nil {
+			if err := tryCollectionLock(ctx, tx); err != nil {
 				return fmt.Errorf("wait for collection before report snapshot: %w", err)
 			}
 			schedules, err := loadReportSchedules(ctx, tx, tenant.ID)
@@ -121,7 +142,7 @@ WHERE w.tenant_id=$1::uuid AND w.schedule_id=$2::uuid AND w.status = 'completed'
     WHERE i.tenant_id=w.tenant_id AND i.schedule_id=w.schedule_id
       AND i.due_at=w.due_at AND i.window_end_at=w.window_end_at
   )
-  AND (r.id IS NULL OR (r.attempts < 3 AND
+  AND (r.id IS NULL OR (r.deleted_at IS NULL AND r.attempts < 3 AND
     (r.status = 'failed' OR (r.status = 'generating' AND r.claimed_at < pg_catalog.clock_timestamp() - interval '15 minutes'))))
 ORDER BY w.due_at DESC
 LIMIT 1`, tenantID, schedules[index].ID).Scan(&schedules[index].PendingDue, &schedules[index].PendingWindowEnd)
@@ -145,14 +166,20 @@ WHERE tenant_id=$1::uuid AND schedule_id=$2::uuid AND status='pending'`, tenantI
 }
 
 func claimScheduledReport(ctx context.Context, tx reportStore, tenantID, tenantName string, schedule reportSchedule, dueAt, windowEnd, now time.Time) (ReportWork, bool, error) {
-	var hasItems bool
+	var hasItems, deleted bool
 	if err := tx.QueryRow(ctx, `SELECT EXISTS (
   SELECT 1 FROM public.digest_window_items
   WHERE tenant_id=$1::uuid AND schedule_id=$2::uuid AND due_at=$3 AND window_end_at=$4
-)`, tenantID, schedule.ID, dueAt, windowEnd).Scan(&hasItems); err != nil {
+), EXISTS (
+  SELECT 1 FROM public.reports
+  WHERE tenant_id=$1::uuid AND schedule_id=$2::uuid AND due_at=$3
+    AND trigger='scheduled' AND deleted_at IS NOT NULL
+)`, tenantID, schedule.ID, dueAt, windowEnd).Scan(&hasItems, &deleted); err != nil {
 		return ReportWork{}, false, fmt.Errorf("check scheduled report snapshot: %w", err)
 	}
-	if !hasItems {
+	// A deleted report keeps its window identity. Use the existing terminal
+	// window handling, which waits for active delivery leases before advancing.
+	if deleted || !hasItems {
 		if err := completeNoopDigestWindow(ctx, tx, tenantID, schedule.ID, dueAt, windowEnd); err != nil {
 			return ReportWork{}, false, err
 		}
@@ -173,7 +200,7 @@ func claimScheduledReport(ctx context.Context, tx reportStore, tenantID, tenantN
   ON CONFLICT (tenant_id,schedule_id,due_at) WHERE trigger='scheduled'
   DO UPDATE SET status = 'generating', attempts = public.reports.attempts + 1,
       claim_token = pg_catalog.gen_random_uuid(), claimed_at = EXCLUDED.claimed_at, last_error = NULL
-  WHERE public.reports.attempts < 3
+  WHERE public.reports.deleted_at IS NULL AND public.reports.attempts < 3
     AND ((public.reports.status = 'generating' AND public.reports.claimed_at < EXCLUDED.claimed_at - interval '15 minutes')
       OR public.reports.status = 'failed')
   RETURNING id,tenant_id,schedule_id,due_at,window_start_at,window_end_at,tenant_name,schedule_name,trigger,relative_path,claim_token,attempts
@@ -195,19 +222,21 @@ FROM claimed`, tenantID, schedule.ID, dueAt, windowStart, windowEnd, now, tenant
 }
 
 const scheduledReportItemsSQL = `INSERT INTO public.report_items
-    (tenant_id,report_id,ordinal,match_id,notice_id,title,category,agency,region,amount,deadline_at,source_url,rule_name,reasons)
-SELECT $1::uuid,$2::uuid,row_number() OVER (ORDER BY i.title,i.notice_id,i.matched_at,i.match_id),
+    (tenant_id,report_id,ordinal,match_id,notice_id,title,category,agency,region,amount,deadline_at,source_url,rule_name,reasons,
+     source_kind,posted_at,collected_at,recorded_at)
+SELECT $1::uuid,$2::uuid,row_number() OVER (ORDER BY n.published_at DESC NULLS LAST,i.title,i.notice_id,i.matched_at,i.match_id),
        i.match_id,i.notice_id,i.title,
        n.payload->>'Category',COALESCE(n.payload->>'Agency',''),COALESCE(n.payload->>'Region',''),
        COALESCE(NULLIF(n.payload->>'Amount',''),'0')::bigint,
        COALESCE(n.deadline_at,TIMESTAMPTZ '0001-01-01 00:00:00+00'),i.source_url,
-       COALESCE(f.name,''),i.reasons
+       COALESCE(f.name,''),i.reasons,
+       '입찰공고목록-입찰공고',n.published_at,n.collected_at,i.matched_at
 FROM public.digest_window_items i
 JOIN public.notices n ON n.id=i.notice_id
 LEFT JOIN public.matches m ON m.tenant_id=i.tenant_id AND m.id=i.match_id
 LEFT JOIN public.filters f ON f.tenant_id=m.tenant_id AND f.id=m.filter_id
 WHERE i.tenant_id=$1::uuid AND i.schedule_id=$3::uuid AND i.due_at=$4 AND i.window_end_at=$5
-ORDER BY i.title,i.notice_id,i.matched_at,i.match_id
+ORDER BY n.published_at DESC NULLS LAST,i.title,i.notice_id,i.matched_at,i.match_id
 ON CONFLICT (tenant_id,report_id,match_id) DO NOTHING`
 
 func (r *PostgresRepository) ClaimManualReport(ctx context.Context, tenantID string, now time.Time) (ReportWork, bool, error) {
@@ -217,17 +246,36 @@ func (r *PostgresRepository) ClaimManualReport(ctx context.Context, tenantID str
 	var work ReportWork
 	var claimed bool
 	err := r.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx, `SELECT pg_catalog.pg_advisory_xact_lock($1)`, collectionAdvisoryLock); err != nil {
-			return fmt.Errorf("wait for collection before manual report snapshot: %w", err)
+		// Evaluate and snapshot at one database time after acquiring the lock.
+		snapshotAt, err := lockDigestSnapshot(ctx, tx)
+		if err != nil {
+			return err
 		}
-		var err error
-		work, claimed, err = claimManualReport(ctx, tx, tenantID, now)
+		work, claimed, err = claimManualReport(ctx, tx, tenantID, snapshotAt)
 		return err
 	})
 	return work, claimed, err
 }
 
-func claimManualReport(ctx context.Context, tx reportStore, tenantID string, now time.Time) (ReportWork, bool, error) {
+func claimManualReport(ctx context.Context, tx interface {
+	reportStore
+	filterMatchBatcher
+}, tenantID string, now time.Time) (ReportWork, bool, error) {
+	// Every entry point (web and CLI) refreshes the same active filter set in
+	// the claim transaction, before inspecting or copying stored matches.
+	notices, err := loadActiveNotices(ctx, tx, now)
+	if err != nil {
+		return ReportWork{}, false, err
+	}
+	filters, err := loadEnabledFilters(ctx, tx, tenantID)
+	if err != nil {
+		return ReportWork{}, false, err
+	}
+	for _, filter := range filters {
+		if err := refreshFilterMatches(ctx, tx, now, filter, notices); err != nil {
+			return ReportWork{}, false, err
+		}
+	}
 	var tenantName string
 	if err := tx.QueryRow(ctx, `SELECT name FROM public.tenants WHERE id=$1::uuid`, tenantID).Scan(&tenantName); err != nil {
 		return ReportWork{}, false, fmt.Errorf("load manual report tenant: %w", err)
@@ -262,17 +310,19 @@ FROM claimed`, tenantID, now, tenantName)
 		return ReportWork{}, ok, err
 	}
 	tag, err := tx.Exec(ctx, `INSERT INTO public.report_items
-    (tenant_id,report_id,ordinal,match_id,notice_id,title,category,agency,region,amount,deadline_at,source_url,rule_name,reasons)
-SELECT $1::uuid,$2::uuid,row_number() OVER (ORDER BY n.title,n.id,m.created_at,m.id),
+    (tenant_id,report_id,ordinal,match_id,notice_id,title,category,agency,region,amount,deadline_at,source_url,rule_name,reasons,
+     source_kind,posted_at,collected_at,recorded_at)
+SELECT $1::uuid,$2::uuid,row_number() OVER (ORDER BY n.published_at DESC NULLS LAST,n.title,n.id,m.created_at,m.id),
        m.id,n.id,n.title,n.payload->>'Category',COALESCE(n.payload->>'Agency',''),
        COALESCE(n.payload->>'Region',''),COALESCE(NULLIF(n.payload->>'Amount',''),'0')::bigint,
        COALESCE(n.deadline_at,TIMESTAMPTZ '0001-01-01 00:00:00+00'),
-       COALESCE(NULLIF(n.payload->>'SourceURL',''),n.payload->>'source_url',''),f.name,m.reasons
+       COALESCE(NULLIF(n.payload->>'SourceURL',''),n.payload->>'source_url',''),f.name,m.reasons,
+       '입찰공고목록-입찰공고',n.published_at,n.collected_at,m.created_at
 FROM public.matches m
 JOIN public.filters f ON f.tenant_id=m.tenant_id AND f.id=m.filter_id AND f.enabled
 JOIN public.notices n ON n.id=m.notice_id
 WHERE m.tenant_id=$1::uuid AND (n.deadline_at IS NULL OR n.deadline_at >= $3)
-ORDER BY n.title,n.id,m.created_at,m.id`, tenantID, work.ReportID, now)
+ORDER BY n.published_at DESC NULLS LAST,n.title,n.id,m.created_at,m.id`, tenantID, work.ReportID, now)
 	if err != nil {
 		return ReportWork{}, false, fmt.Errorf("snapshot manual report items: %w", err)
 	}
@@ -300,7 +350,7 @@ func reclaimReport(ctx context.Context, tx reportStore, tenantID, reportID strin
 	row := tx.QueryRow(ctx, `WITH claimed AS (
   UPDATE public.reports
   SET status = 'generating',attempts = attempts + 1,claim_token = pg_catalog.gen_random_uuid(),claimed_at=pg_catalog.clock_timestamp(),last_error=NULL
-  WHERE tenant_id=$1::uuid AND id=$2::uuid AND attempts < 3
+  WHERE tenant_id=$1::uuid AND id=$2::uuid AND deleted_at IS NULL AND attempts < 3
     AND ((status = 'generating' AND claimed_at < pg_catalog.clock_timestamp() - interval '15 minutes') OR status = 'failed')
   RETURNING *
 )
@@ -328,7 +378,7 @@ func retryReport(ctx context.Context, tx reportStore, tenantID, reportID string,
 	row := tx.QueryRow(ctx, `WITH claimed AS (
   UPDATE public.reports
   SET status = 'generating',attempts = 1,claim_token = pg_catalog.gen_random_uuid(),claimed_at=$3,last_error=NULL
-  WHERE tenant_id=$1::uuid AND id=$2::uuid AND status = 'failed'
+  WHERE tenant_id=$1::uuid AND id=$2::uuid AND deleted_at IS NULL AND status = 'failed'
   RETURNING *
 )
 SELECT c.id::text,c.tenant_id::text,c.tenant_name,COALESCE(c.schedule_id::text,''),c.schedule_name,
@@ -362,7 +412,8 @@ func scanReportWork(row pgx.Row) (ReportWork, bool, error) {
 }
 
 func loadReportNotices(ctx context.Context, tx reportStore, work *ReportWork) error {
-	rows, err := tx.Query(ctx, `SELECT notice_id::text,title,category,agency,region,amount,deadline_at,source_url,rule_name,reasons
+	rows, err := tx.Query(ctx, `SELECT notice_id::text,title,category,agency,region,amount,deadline_at,source_url,rule_name,reasons,
+source_kind,posted_at,collected_at,recorded_at
 FROM public.report_items
 WHERE tenant_id=$1::uuid AND report_id=$2::uuid
 ORDER BY ordinal`, work.TenantID, work.ReportID)
@@ -375,8 +426,11 @@ ORDER BY ordinal`, work.TenantID, work.ReportID)
 		var noticeID, title, category, agency, region, sourceURL, ruleName string
 		var amount int64
 		var deadline time.Time
+		var sourceKind *string
+		var postedAt, collectedAt, recordedAt *time.Time
 		var raw []byte
-		if err := rows.Scan(&noticeID, &title, &category, &agency, &region, &amount, &deadline, &sourceURL, &ruleName, &raw); err != nil {
+		if err := rows.Scan(&noticeID, &title, &category, &agency, &region, &amount, &deadline, &sourceURL, &ruleName, &raw,
+			&sourceKind, &postedAt, &collectedAt, &recordedAt); err != nil {
 			return fmt.Errorf("scan report item: %w", err)
 		}
 		var reasons storedMatchReasons
@@ -387,10 +441,26 @@ ORDER BY ordinal`, work.TenantID, work.ReportID)
 		if !exists {
 			index = len(work.Notices)
 			byNotice[noticeID] = index
-			work.Notices = append(work.Notices, report.Notice{
+			notice := report.Notice{
 				ID: noticeID, Title: title, Category: category, Agency: agency, Region: region,
 				Amount: amount, Deadline: deadline, SourceURL: sourceURL,
-			})
+			}
+			if sourceKind != nil {
+				notice.SourceKind = *sourceKind
+			}
+			if postedAt != nil {
+				notice.PostedAt = *postedAt
+			}
+			if collectedAt != nil {
+				notice.CollectedAt = *collectedAt
+			}
+			if recordedAt != nil {
+				notice.RecordedAt = *recordedAt
+			}
+			work.Notices = append(work.Notices, notice)
+		}
+		for _, keyword := range matchedKeywords(reasons) {
+			work.Notices[index].Keywords = appendUnique(work.Notices[index].Keywords, keyword)
 		}
 		work.Notices[index].Matches = append(work.Notices[index].Matches, report.Match{RuleName: ruleName, Reasons: readableMatchReasons(reasons)})
 	}
@@ -398,6 +468,17 @@ ORDER BY ordinal`, work.TenantID, work.ReportID)
 		return fmt.Errorf("iterate report items: %w", err)
 	}
 	return nil
+}
+
+func matchedKeywords(payload storedMatchReasons) []string {
+	var keywords []string
+	for _, detail := range payload.Details {
+		switch matcher.Reason(detail.Code) {
+		case matcher.ReasonIncludeAny, matcher.ReasonIncludeAll:
+			keywords = appendUnique(keywords, detail.RuleValue)
+		}
+	}
+	return keywords
 }
 
 func (r *PostgresRepository) FinalizeReport(ctx context.Context, work ReportWork, artifact ReportArtifact, generatedAt time.Time) error {
@@ -440,7 +521,7 @@ WHERE tenant_id=$1::uuid AND id=$2::uuid AND status = 'generating' AND claim_tok
   FOR UPDATE
 ), completed_window AS (
   UPDATE public.digest_windows w
-  SET status='completed',completed_at=COALESCE(w.completed_at,$6)
+  SET status='completed',completed_at=COALESCE(w.completed_at,$5)
   FROM target_window target
   WHERE target.status = 'pending'
     AND w.tenant_id=target.tenant_id AND w.schedule_id=target.schedule_id
@@ -457,7 +538,7 @@ WHERE tenant_id=$1::uuid AND id=$2::uuid AND status = 'generating' AND claim_tok
   WHERE tenant_id=$1::uuid AND id=$2::uuid
   RETURNING id
 )
-SELECT 1 FROM advanced_schedule`, work.TenantID, work.ScheduleID, work.DueAt, work.WindowEnd, work.ReportID, generatedAt)
+SELECT 1 FROM advanced_schedule`, work.TenantID, work.ScheduleID, work.DueAt, work.WindowEnd, generatedAt)
 	if err != nil {
 		return fmt.Errorf("complete scheduled report window: %w", err)
 	}

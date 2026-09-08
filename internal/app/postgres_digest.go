@@ -110,7 +110,7 @@ func (r *PostgresRepository) DueDigests(ctx context.Context, _ time.Time) ([]Dig
 }
 
 func lockDigestSnapshot(ctx context.Context, tx digestWindowStore) (time.Time, error) {
-	if _, err := tx.Exec(ctx, `SELECT pg_catalog.pg_advisory_xact_lock($1)`, collectionAdvisoryLock); err != nil {
+	if err := tryCollectionLock(ctx, tx); err != nil {
 		return time.Time{}, fmt.Errorf("wait for collection before digest snapshot: %w", err)
 	}
 	var cutoff time.Time

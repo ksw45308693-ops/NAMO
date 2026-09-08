@@ -183,7 +183,11 @@ func mergeStoredRegion(notice model.Notice, payload []byte, lookupComplete bool)
 }
 
 func (r *PostgresRepository) ActiveNotices(ctx context.Context, now time.Time) ([]ActiveNotice, error) {
-	rows, err := r.Pool.Query(ctx, `SELECT id::text, payload, region_lookup_complete
+	return loadActiveNotices(ctx, r.Pool, now)
+}
+
+func loadActiveNotices(ctx context.Context, queryer filterRowsQuerier, now time.Time) ([]ActiveNotice, error) {
+	rows, err := queryer.Query(ctx, `SELECT id::text, payload, region_lookup_complete
 		FROM public.notices
 		WHERE deadline_at IS NULL OR deadline_at >= $1
 		ORDER BY published_at DESC NULLS LAST, id`, now)

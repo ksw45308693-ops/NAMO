@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -32,6 +33,7 @@ func (digestRowsStub) Next() bool { return false }
 
 type digestSnapshotStub struct {
 	cutoff time.Time
+	busy   bool
 	calls  []string
 	args   [][]any
 }
@@ -39,12 +41,18 @@ type digestSnapshotStub struct {
 func (s *digestSnapshotStub) Exec(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
 	s.calls = append(s.calls, sql)
 	s.args = append(s.args, args)
+	if s.busy {
+		return pgconn.CommandTag{}, context.DeadlineExceeded
+	}
 	return pgconn.NewCommandTag("SELECT 1"), nil
 }
 
 func (s *digestSnapshotStub) QueryRow(_ context.Context, sql string, args ...any) pgx.Row {
 	s.calls = append(s.calls, sql)
 	s.args = append(s.args, args)
+	if strings.Contains(sql, "pg_try_advisory_xact_lock") {
+		return lockRow{locked: !s.busy}
+	}
 	return digestRowStub{value: s.cutoff}
 }
 
@@ -135,7 +143,7 @@ func TestDigestWindowReusesPersistedSnapshotAndMatchQueryUsesThatExactBoundary(t
 	}
 }
 
-func TestDigestSnapshotWaitsForCollectorBeforeReadingDatabaseCutoff(t *testing.T) {
+func TestDigestSnapshotLocksBeforeReadingDatabaseCutoff(t *testing.T) {
 	cutoff := time.Date(2026, 9, 2, 10, 0, 0, 0, time.UTC)
 	stub := &digestSnapshotStub{cutoff: cutoff}
 
@@ -143,11 +151,22 @@ func TestDigestSnapshotWaitsForCollectorBeforeReadingDatabaseCutoff(t *testing.T
 	if err != nil || !got.Equal(cutoff) {
 		t.Fatalf("cutoff=%v err=%v", got, err)
 	}
-	if len(stub.calls) != 2 || !strings.Contains(stub.calls[0], "pg_advisory_xact_lock") || !strings.Contains(stub.calls[1], "clock_timestamp") {
+	if len(stub.calls) != 2 || !strings.Contains(stub.calls[0], "pg_try_advisory_xact_lock") || !strings.Contains(stub.calls[1], "clock_timestamp") {
 		t.Fatalf("snapshot lock/cutoff order=%q", stub.calls)
 	}
 	if len(stub.args[0]) != 1 || stub.args[0][0] != collectionAdvisoryLock {
 		t.Fatalf("snapshot lock key=%#v, collection key=%d", stub.args[0], collectionAdvisoryLock)
+	}
+}
+
+func TestDigestSnapshotReturnsBusyWithoutWaitingOrReadingCutoff(t *testing.T) {
+	stub := &digestSnapshotStub{busy: true}
+	cutoff, err := lockDigestSnapshot(context.Background(), stub)
+	if !errors.Is(err, ErrCollectionRunning) || !cutoff.IsZero() {
+		t.Fatalf("cutoff=%v err=%v; want retryable busy result", cutoff, err)
+	}
+	if len(stub.calls) != 1 {
+		t.Fatalf("busy snapshot read data before acquiring lock: %q", stub.calls)
 	}
 }
 

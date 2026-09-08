@@ -77,8 +77,8 @@ func TestValidateCommandRequiresOnlyItsExternalService(t *testing.T) {
 	if err := cfg.ValidateCommand("migrate"); err != nil {
 		t.Fatalf("migrate validation = %v", err)
 	}
-	if err := cfg.ValidateCommand("collect-once"); err == nil || !strings.Contains(err.Error(), "G2B_API_KEY") {
-		t.Fatalf("collect-once validation = %v, want G2B_API_KEY error", err)
+	if err := cfg.ValidateCommand("collect-once"); err != nil {
+		t.Fatalf("collect-once must resolve its key at execution: %v", err)
 	}
 	if err := cfg.ValidateCommand("send-test-mail"); err == nil || !strings.Contains(err.Error(), "SMTP_HOST") {
 		t.Fatalf("send-test-mail validation = %v, want SMTP_HOST error", err)
@@ -88,7 +88,7 @@ func TestValidateCommandRequiresOnlyItsExternalService(t *testing.T) {
 func TestValidateServeRequiresHTTPSAndLoopbackListener(t *testing.T) {
 	base := Config{
 		DatabaseURL:  "postgres://runtime@localhost/monitor",
-		G2BAPIKey:    "test-key",
+		G2BAPIKey:    "",
 		SessionKey:   strings.Repeat("s", 32),
 		BaseURL:      "https://monitor.example.internal",
 		ListenAddr:   "127.0.0.1:8080",

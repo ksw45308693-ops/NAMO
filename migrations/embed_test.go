@@ -12,8 +12,24 @@ func TestAllReturnsOrderedOperationalMigrations(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(migrations) != 9 || migrations[0].Version != 1 || migrations[1].Version != 2 || migrations[2].Version != 3 || migrations[3].Version != 4 || migrations[4].Version != 5 || migrations[5].Version != 6 || migrations[6].Version != 7 || migrations[7].Version != 8 || migrations[8].Version != 9 {
-		t.Fatalf("migrations = %+v", migrations)
+	if len(migrations) != 19 {
+		t.Fatalf("migration count = %d, want 19", len(migrations))
+	}
+	for index, migration := range migrations {
+		if migration.Version != index+1 {
+			t.Fatalf("migration %d has version %d", index, migration.Version)
+		}
+	}
+	for _, contract := range []string{
+		"UPDATE public.users",
+		"SET email = 'admin'",
+		"email = 'admin@namo.invalid'",
+		"role = 'platform_admin'",
+		"tenant_id IS NULL",
+	} {
+		if !strings.Contains(migrations[14].SQL, contract) {
+			t.Fatalf("platform login migration missing contract: %s", contract)
+		}
 	}
 	for _, migration := range migrations {
 		if strings.TrimSpace(migration.SQL) == "" {
@@ -191,6 +207,152 @@ func TestAllReturnsOrderedOperationalMigrations(t *testing.T) {
 	} {
 		if strings.Contains(migrations[6].SQL, forbidden) {
 			t.Fatalf("report delivery migration contains forbidden contract: %s", forbidden)
+		}
+	}
+	for _, contract := range []string{
+		"ALTER TABLE public.users ADD CONSTRAINT users_role_tenant_scope",
+		"(role = 'platform_admin' AND tenant_id IS NULL)",
+		"(role = 'tenant_admin' AND tenant_id IS NOT NULL)",
+		"CREATE ROLE namo_signup_definer NOLOGIN",
+		"BYPASSRLS NOINHERIT",
+		"CREATE FUNCTION public.signup_create_account",
+		"CREATE FUNCTION public.signup_member_accounts",
+		"CREATE FUNCTION public.signup_set_account_tenant",
+		"hashtextextended('namo-invitation:' ||",
+		"email already belongs to an account",
+		"invitation already pending",
+		"platform administrator role is required",
+		"VALUES (NULL, v_email, v_display_name, p_password_hash, 'member')",
+		"WHERE id = p_user_id AND role = 'member'",
+		"OWNER TO namo_signup_definer",
+		"REVOKE ALL ON FUNCTION public.signup_create_account(text, text) FROM PUBLIC",
+		"GRANT EXECUTE ON FUNCTION public.signup_create_account(text, text) TO namo_runtime",
+		"GRANT EXECUTE ON FUNCTION public.signup_member_accounts(uuid) TO namo_runtime",
+		"GRANT EXECUTE ON FUNCTION public.signup_set_account_tenant(uuid, uuid, uuid) TO namo_runtime",
+	} {
+		if !strings.Contains(migrations[9].SQL, contract) {
+			t.Fatalf("self signup migration missing contract: %s", contract)
+		}
+	}
+	for _, forbidden := range []string{
+		"GRANT DELETE ON TABLE public.users TO namo_signup_definer",
+		"GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.users TO namo_signup_definer",
+	} {
+		if strings.Contains(migrations[9].SQL, forbidden) {
+			t.Fatalf("self signup migration contains forbidden contract: %s", forbidden)
+		}
+	}
+	for _, contract := range []string{
+		"CREATE OR REPLACE FUNCTION public.signup_create_account",
+		"CREATE OR REPLACE FUNCTION public.signup_member_accounts",
+		"CREATE OR REPLACE FUNCTION public.signup_set_account_tenant",
+		"WHERE lower(existing.email) = v_email",
+		"WHERE lower(pending.email) = v_email",
+		"WHERE actor.id = p_actor_user_id AND actor.tenant_id IS NULL AND actor.role = 'platform_admin'",
+		"WHERE member.id = p_user_id AND member.role = 'member'",
+		"RETURNING member.email INTO v_email",
+	} {
+		if !strings.Contains(migrations[10].SQL, contract) {
+			t.Fatalf("signup qualification migration missing contract: %s", contract)
+		}
+	}
+	// Every column reference that shares a name with a RETURNS TABLE output
+	// must stay qualified; an unqualified one fails only at run time.
+	for _, forbidden := range []string{
+		"WHERE lower(email) = v_email",
+		"AND tenant_id IS NULL AND role = 'platform_admin'",
+		"WHERE id = p_user_id AND role = 'member'",
+		"RETURNING email INTO v_email",
+	} {
+		if strings.Contains(migrations[10].SQL, forbidden) {
+			t.Fatalf("signup qualification migration keeps an ambiguous reference: %s", forbidden)
+		}
+	}
+	for _, contract := range []string{
+		"ALTER TABLE public.tenants ADD COLUMN admin_name",
+		"ALTER TABLE public.tenants ADD COLUMN admin_email",
+		"ADD CONSTRAINT tenants_admin_contact_length",
+		"GRANT SELECT, INSERT ON TABLE public.tenants, public.schedules TO namo_signup_definer",
+		"CREATE FUNCTION public.admin_register_tenant",
+		"CREATE FUNCTION public.admin_tenant_registry",
+		"hashtextextended('namo-tenant-registry:' ||",
+		"tenant is already registered",
+		"platform administrator role is required",
+		"INSERT INTO public.tenants (name, contact_email, admin_name, admin_email)",
+		"INSERT INTO public.schedules (tenant_id, name, hour, minute, timezone, weekdays)",
+		"ON CONFLICT (tenant_id, name) DO NOTHING",
+		"OWNER TO namo_signup_definer",
+		"GRANT EXECUTE ON FUNCTION public.admin_register_tenant(uuid, text, text, text, text) TO namo_runtime",
+		"GRANT EXECUTE ON FUNCTION public.admin_tenant_registry(uuid) TO namo_runtime",
+	} {
+		if !strings.Contains(migrations[11].SQL, contract) {
+			t.Fatalf("tenant registry migration missing contract: %s", contract)
+		}
+	}
+	// Registration must never create an invitation or a user account.
+	for _, forbidden := range []string{
+		"public.invitations",
+		"INSERT INTO public.users",
+		"token_hash",
+	} {
+		if strings.Contains(migrations[11].SQL, forbidden) {
+			t.Fatalf("tenant registry migration must not touch invitations or accounts: %s", forbidden)
+		}
+	}
+	for _, contract := range []string{
+		"DROP FUNCTION public.signup_set_account_tenant(uuid, uuid, uuid)",
+		"DROP FUNCTION public.signup_member_accounts(uuid)",
+		"CREATE FUNCTION public.admin_account_registry",
+		"CREATE FUNCTION public.admin_set_account_access",
+		"#variable_conflict use_column",
+		"WHERE seat.role IN ('member', 'tenant_admin')",
+		"UPDATE public.users seat SET tenant_id = p_tenant_id, role = v_role",
+		"WHERE seat.id = p_user_id AND seat.role IN ('member', 'tenant_admin')",
+		"account role must be member or tenant_admin",
+		"a company is required for the tenant_admin role",
+		"platform administrator role is required",
+		"OWNER TO namo_signup_definer",
+		"GRANT EXECUTE ON FUNCTION public.admin_account_registry(uuid) TO namo_runtime",
+		"GRANT EXECUTE ON FUNCTION public.admin_set_account_access(uuid, uuid, uuid, text) TO namo_runtime",
+	} {
+		if !strings.Contains(migrations[12].SQL, contract) {
+			t.Fatalf("account access migration missing contract: %s", contract)
+		}
+	}
+	// A platform administrator must never be a target of company access.
+	for _, forbidden := range []string{
+		"seat.role = 'platform_admin'",
+		"v_role = 'platform_admin'",
+	} {
+		if strings.Contains(migrations[12].SQL, forbidden) {
+			t.Fatalf("account access migration must not touch platform administrators: %s", forbidden)
+		}
+	}
+	for _, contract := range []string{
+		"GRANT DELETE ON TABLE public.users TO namo_signup_definer",
+		"CREATE FUNCTION public.tenant_remove_member",
+		"CREATE FUNCTION public.admin_delete_account",
+		"company administrator role is required",
+		"an administrator cannot remove itself",
+		"an administrator cannot delete itself",
+		"UPDATE public.users seat SET tenant_id = NULL, role = 'member'",
+		"DELETE FROM public.users seat",
+		"WHERE seat.id = p_user_id AND seat.role IN ('member', 'tenant_admin')",
+		"OWNER TO namo_signup_definer",
+		"GRANT EXECUTE ON FUNCTION public.tenant_remove_member(uuid, uuid, uuid) TO namo_runtime",
+		"GRANT EXECUTE ON FUNCTION public.admin_delete_account(uuid, uuid) TO namo_runtime",
+	} {
+		if !strings.Contains(migrations[13].SQL, contract) {
+			t.Fatalf("account removal migration missing contract: %s", contract)
+		}
+	}
+	for _, forbidden := range []string{
+		"DELETE FROM public.tenants",
+		"DELETE FROM public.sessions",
+		"DROP TABLE",
+	} {
+		if strings.Contains(migrations[13].SQL, forbidden) {
+			t.Fatalf("account removal migration deletes more than one account: %s", forbidden)
 		}
 	}
 	for _, forbidden := range []string{"tenant_name", "schedule_name"} {

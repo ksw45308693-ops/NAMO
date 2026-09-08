@@ -17,6 +17,7 @@ type Config struct {
 	DatabaseURL          string
 	MigrationDatabaseURL string
 	G2BAPIKey            string
+	G2BAPIKeyFile        string
 	SMTPHost             string
 	SMTPPort             int
 	SMTPUser             string
@@ -38,6 +39,7 @@ func Load(lookup LookupFunc) (Config, error) {
 		DatabaseURL:          value(lookup, "DATABASE_URL", ""),
 		MigrationDatabaseURL: value(lookup, "MIGRATION_DATABASE_URL", ""),
 		G2BAPIKey:            value(lookup, "G2B_API_KEY", ""),
+		G2BAPIKeyFile:        value(lookup, "G2B_API_KEY_FILE", defaultAPIKeyFile()),
 		SMTPHost:             value(lookup, "SMTP_HOST", ""),
 		SMTPUser:             value(lookup, "SMTP_USER", ""),
 		SMTPPassword:         value(lookup, "SMTP_PASSWORD", ""),
@@ -69,9 +71,6 @@ func Load(lookup LookupFunc) (Config, error) {
 func (c Config) ValidateCommand(command string) error {
 	switch command {
 	case "serve":
-		if strings.TrimSpace(c.G2BAPIKey) == "" {
-			return fmt.Errorf("G2B_API_KEY is required for serve")
-		}
 		if err := c.validateReportDelivery(command); err != nil {
 			return err
 		}
@@ -83,9 +82,7 @@ func (c Config) ValidateCommand(command string) error {
 			return err
 		}
 	case "collect-once":
-		if strings.TrimSpace(c.G2BAPIKey) == "" {
-			return fmt.Errorf("G2B_API_KEY is required for collect-once")
-		}
+		// The current key is resolved from the private file at collection time.
 	case "send-test-mail":
 		if strings.TrimSpace(c.SMTPHost) == "" {
 			return fmt.Errorf("SMTP_HOST is required for send-test-mail")

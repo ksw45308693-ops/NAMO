@@ -4,13 +4,25 @@ import (
 	"context"
 	"errors"
 	"io"
+	"mime"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestAgencyLabelsDescribeAnnouncementAgency(t *testing.T) {
+	for _, path := range []string{"/filters", "/notices/2026-sample-001"} {
+		body := serve(t, http.MethodGet, path).Body.String()
+		if !strings.Contains(body, "공고기관") || strings.Contains(body, "수요기관") {
+			t.Errorf("%s must label the stored announcement agency as 공고기관", path)
+		}
+	}
+}
 
 func TestPagesRenderExpectedLandmarks(t *testing.T) {
 	t.Parallel()
@@ -241,6 +253,232 @@ func TestNoticesFilterSampleRows(t *testing.T) {
 	}
 }
 
+func TestNoticesDefaultToAllRowsAndApplySavedFilterWhenSelected(t *testing.T) {
+	t.Parallel()
+
+	all := serve(t, http.MethodGet, "/notices").Body.String()
+	for _, id := range []string{"2026-sample-001", "2026-sample-002", "2026-sample-003"} {
+		if !strings.Contains(all, id) {
+			t.Errorf("unfiltered notices missing %q", id)
+		}
+	}
+	if !strings.Contains(all, ">전체 공고 <strong>3건</strong>") {
+		t.Error("unfiltered list is not labelled as all notices")
+	}
+
+	filtered := serve(t, http.MethodGet, "/notices?filter=1").Body.String()
+	if !strings.Contains(filtered, "2026-sample-001") || strings.Contains(filtered, "2026-sample-002") || strings.Contains(filtered, "2026-sample-003") {
+		t.Errorf("saved filter did not isolate its matched notice")
+	}
+	if !strings.Contains(filtered, `name="filter"`) || !strings.Contains(filtered, `value="1" selected`) {
+		t.Error("saved filter selection is not preserved")
+	}
+}
+
+func TestNoticeSearchAndSavedFilterCombine(t *testing.T) {
+	t.Parallel()
+
+	body := serve(t, http.MethodGet, "/notices?filter=2&q="+url.QueryEscape("샘플")).Body.String()
+	if !strings.Contains(body, "2026-sample-002") || strings.Contains(body, "2026-sample-001") {
+		t.Error("search did not narrow the selected saved filter")
+	}
+}
+
+func TestNoticePaginationSupportsTenTwentyThirtyAndPreservesFilters(t *testing.T) {
+	t.Parallel()
+
+	notices := make([]noticeView, 45)
+	for i := range notices {
+		notices[i].ID = strconv.Itoa(i + 1)
+	}
+	query := url.Values{
+		"q":        {"감사"},
+		"filter":   {"filter-1"},
+		"category": {"용역"},
+		"region":   {"서울"},
+		"per_page": {"20"},
+		"page":     {"2"},
+	}
+	page, pagination := paginateNotices(notices, query)
+	if len(page) != 20 || page[0].ID != "21" || page[19].ID != "40" {
+		t.Fatalf("page rows=%+v", page)
+	}
+	if pagination.Page != 2 || pagination.Pages != 3 || pagination.PageSize != 20 || pagination.Total != 45 {
+		t.Fatalf("pagination=%+v", pagination)
+	}
+	for _, raw := range []string{pagination.PreviousURL, pagination.NextURL} {
+		parsed, err := url.Parse(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for key, want := range map[string]string{"q": "감사", "filter": "filter-1", "category": "용역", "region": "서울", "per_page": "20"} {
+			if got := parsed.Query().Get(key); got != want {
+				t.Fatalf("%s=%q in %q, want %q", key, got, raw, want)
+			}
+		}
+	}
+
+	_, fallback := paginateNotices(notices, url.Values{"per_page": {"99"}, "page": {"99"}})
+	if fallback.PageSize != 10 || fallback.Page != 5 || fallback.Pages != 5 {
+		t.Fatalf("fallback pagination=%+v", fallback)
+	}
+	_, empty := paginateNotices(nil, url.Values{"page": {"99"}})
+	if empty.Page != 1 || empty.Pages != 0 || empty.PreviousURL != "" || empty.NextURL != "" {
+		t.Fatalf("empty pagination=%+v", empty)
+	}
+}
+
+func TestNoticePageRendersPageSizeChoices(t *testing.T) {
+	t.Parallel()
+
+	body := serve(t, http.MethodGet, "/notices?per_page=20").Body.String()
+	for _, want := range []string{`name="per_page"`, `value="10"`, `value="20" selected`, `value="30"`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("page size control missing %q", want)
+		}
+	}
+}
+
+func TestNoticeTableShowsSearchHistoryColumns(t *testing.T) {
+	body := serve(t, http.MethodGet, "/notices").Body.String()
+	start := strings.Index(body, "<thead>")
+	end := strings.Index(body, "</thead>")
+	if start < 0 || end < start {
+		t.Fatal("notice table missing")
+	}
+	header := body[start:end]
+	labels := []string{"구분", "일자", "시간", "키워드", "업무구분", "업무여부", "공고명", "공고기관", "진행·게시일자", "추정가격", "마감"}
+	last := -1
+	for _, label := range labels {
+		index := strings.Index(header, `<th scope="col">`+label+`</th>`)
+		if index <= last {
+			t.Fatalf("notice table missing or misordered %q: %s", label, header)
+		}
+		last = index
+		if !strings.Contains(body, `data-label="`+label+`"`) {
+			t.Fatalf("missing mobile label %q", label)
+		}
+	}
+	if strings.Count(header, `<th scope="col">`) != 11 || strings.Contains(body, "레코드생성일시") {
+		t.Fatal("unexpected screen columns")
+	}
+}
+
+func TestNoticeSearchHistoryTitleKeepsMobileBlockAndTouchTarget(t *testing.T) {
+	body := serve(t, http.MethodGet, "/notices").Body.String()
+	if !strings.Contains(body, `<td data-label="공고명" class="notice-title-cell">`) {
+		t.Error("notice title is missing its semantic mobile layout class")
+	}
+	stylesheet := serve(t, http.MethodGet, "/assets/app.css").Body.String()
+	_, mobile, ok := strings.Cut(stylesheet, "@media (max-width: 560px)")
+	if !ok {
+		t.Fatal("phone styles missing")
+	}
+	for _, want := range []string{
+		`td.notice-title-cell { display: block;`,
+		`td.notice-title-cell::before { display: block;`,
+		`td.notice-title-cell > a { display: inline-flex; align-items: center; min-width: 44px; min-height: 44px; }`,
+	} {
+		if !strings.Contains(mobile, want) {
+			t.Errorf("notice title mobile contract missing %q", want)
+		}
+	}
+}
+
+func TestSearchHistorySelectionKeepsOnlySelectedKeywordsWithoutMutation(t *testing.T) {
+	notices := []NoticeView{{ID: "n1", Title: "스마트폴", Keyword: "경관조명, 스마트폴", Reasons: []string{"A 사유", "B 사유"},
+		FilterKeywords: map[string]string{"a": "경관조명", "b": "스마트폴", "metadata": ""},
+		FilterReasons:  map[string][]string{"a": {"A 사유"}, "b": {"B 사유"}, "metadata": {"지역 사유"}},
+	}, {ID: "unmatched"}}
+	for _, tt := range []struct{ id, keyword, reason string }{{"a", "경관조명", "A 사유"}, {"b", "스마트폴", "B 사유"}, {"metadata", "", "지역 사유"}} {
+		got := filterNotices(notices, "", tt.id, "", "")
+		if len(got) != 1 || got[0].Keyword != tt.keyword || !reflect.DeepEqual(got[0].Reasons, []string{tt.reason}) {
+			t.Fatalf("%s selection=%+v", tt.id, got)
+		}
+	}
+	all := filterNotices(notices, "", "", "", "")
+	if len(all) != 2 || all[0].Keyword != "경관조명, 스마트폴" || !reflect.DeepEqual(all[0].Reasons, []string{"A 사유", "B 사유"}) {
+		t.Fatalf("selection mutated original data: %+v", notices)
+	}
+	if notices[0].FilterKeywords["a"] != "경관조명" || notices[0].FilterKeywords["b"] != "스마트폴" {
+		t.Fatal("selection mutated per-filter keywords")
+	}
+}
+
+func TestNoticeTableSearchHistoryValuesAndMissingCells(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		notice NoticeView
+		cells  map[string]string
+	}{
+		{"values", NoticeView{ID: "n1", SourceKind: "입찰공고목록-입찰공고", CollectedDate: "20260107", CollectedClock: "2354", Keyword: "경관조명", Category: "물품", Trade: "내자", Title: "스마트폴 제작", Agency: "만원복지재단", PostedAt: "2026-01-02", Amount: "599,995,000원", Deadline: "2026.01.09 12:00"}, map[string]string{"구분": "입찰공고목록-입찰공고", "일자": "20260107", "시간": "2354", "키워드": "경관조명", "업무구분": "물품", "업무여부": "내자", "공고명": "스마트폴 제작", "공고기관": "만원복지재단", "진행·게시일자": "2026-01-02", "추정가격": "599,995,000원", "마감": "2026.01.09 12:00"}},
+		{"missing", NoticeView{ID: "n1"}, map[string]string{"구분": "-", "일자": "-", "시간": "-", "키워드": "-", "업무구분": "-", "업무여부": "-", "공고명": "-", "공고기관": "-", "진행·게시일자": "-", "추정가격": "-", "마감": "-"}},
+		{"zero amount", NoticeView{ID: "n1", Amount: "0원"}, map[string]string{"추정가격": "-"}},
+		{"undetermined amount", NoticeView{ID: "n1", Amount: "미정"}, map[string]string{"추정가격": "-"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			handler, err := NewHandlerWithOptions(Options{Actions: &recordingActions{}, Backend: &staticBackend{data: AppData{Notices: []NoticeView{tt.notice}}}, MapContext: func(*http.Request) (RequestContext, error) {
+				return RequestContext{TenantID: "tenant-1", Role: "tenant_admin"}, nil
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			body := serveHandler(t, handler, http.MethodGet, "/notices", "").Body.String()
+			for label, want := range tt.cells {
+				_, rest, found := strings.Cut(body, `data-label="`+label+`"`)
+				cell, _, closed := strings.Cut(rest, "</td>")
+				if !found || !closed || !strings.Contains(cell+"</td>", ">"+want+"<") {
+					t.Errorf("%s cell=%q, want %q", label, cell, want)
+				}
+			}
+		})
+	}
+}
+
+func TestSelectedFilterShowsOnlyItsMatchReasons(t *testing.T) {
+	t.Parallel()
+
+	notices := []noticeView{{
+		ID:      "notice-1",
+		Reasons: []string{"필터 A 사유", "필터 B 사유"},
+		FilterReasons: map[string][]string{
+			"filter-a": {"필터 A 사유"},
+			"filter-b": {"필터 B 사유"},
+		},
+	}}
+	got := filterNotices(notices, "", "filter-b", "", "")
+	if len(got) != 1 || !reflect.DeepEqual(got[0].Reasons, []string{"필터 B 사유"}) {
+		t.Fatalf("selected filter reasons=%+v", got)
+	}
+}
+
+func TestNoticeDetailKeepsSelectedFilterAndItsReasons(t *testing.T) {
+	t.Parallel()
+
+	handler, err := NewHandlerWithOptions(Options{
+		Backend: &staticBackend{data: AppData{Notices: []NoticeView{{
+			ID: "notice-1", Title: "공고", Reasons: []string{"필터 A 사유", "필터 B 사유"},
+			FilterReasons: map[string][]string{"filter-a": {"필터 A 사유"}, "filter-b": {"필터 B 사유"}},
+		}}}},
+		Actions: &recordingActions{},
+		MapContext: func(*http.Request) (RequestContext, error) {
+			return RequestContext{TenantID: "tenant-1", Role: "tenant_admin"}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	list := serveHandler(t, handler, http.MethodGet, "/notices?filter=filter-b", "").Body.String()
+	if !strings.Contains(list, `href="/notices/notice-1?filter=filter-b"`) {
+		t.Error("filtered list does not preserve the selected filter in its detail link")
+	}
+	detail := serveHandler(t, handler, http.MethodGet, "/notices/notice-1?filter=filter-b", "").Body.String()
+	if !strings.Contains(detail, "필터 B 사유") || strings.Contains(detail, "필터 A 사유") {
+		t.Error("detail does not isolate the selected filter reason")
+	}
+}
+
 func TestNoticeSearchValueIsEscaped(t *testing.T) {
 	t.Parallel()
 
@@ -287,6 +525,50 @@ func TestInjectedFilterToggleCallsAction(t *testing.T) {
 	}
 }
 
+func TestFilterDeleteUsesConfirmationAndDelegatesValidatedPOST(t *testing.T) {
+	t.Parallel()
+
+	body := serveHandler(t, tenantAdminHandler(t, &recordingActions{}), http.MethodGet, "/filters", "").Body.String()
+	if !strings.Contains(body, `action="/filters/delete"`) || !strings.Contains(body, `data-confirm="실제 필터 필터를 삭제할까요?`) {
+		t.Error("filter delete control or confirmation is missing")
+	}
+
+	actions := &recordingActions{}
+	handler := tenantAdminHandler(t, actions)
+	response := serveHandler(t, handler, http.MethodPost, "/filters/delete", "_csrf=token-123&filter=real-filter")
+	if response.Code != http.StatusSeeOther || response.Header().Get("Location") != "/filters?deleted=1" {
+		t.Fatalf("delete response=%d location=%q", response.Code, response.Header().Get("Location"))
+	}
+	if actions.deleteFilterCalls != 1 || actions.lastDeleteFilter.FilterID != "real-filter" {
+		t.Fatalf("delete action=%#v calls=%d", actions.lastDeleteFilter, actions.deleteFilterCalls)
+	}
+
+	bad := serveHandler(t, handler, http.MethodPost, "/filters/delete", "_csrf=wrong&filter=real-filter")
+	if bad.Code != http.StatusForbidden || actions.deleteFilterCalls != 1 {
+		t.Fatalf("invalid CSRF status=%d calls=%d", bad.Code, actions.deleteFilterCalls)
+	}
+}
+
+func TestFilterDeleteRejectsPlatformAdminWithForgedTenantContext(t *testing.T) {
+	t.Parallel()
+
+	actions := &recordingActions{}
+	handler, err := NewHandlerWithOptions(Options{
+		Backend: &staticBackend{},
+		Actions: actions,
+		MapContext: func(*http.Request) (RequestContext, error) {
+			return RequestContext{TenantID: "tenant-1", Role: "platform_admin", CSRFToken: "token"}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := serveHandler(t, handler, http.MethodPost, "/filters/delete", "_csrf=token&filter=filter-1")
+	if response.Code != http.StatusForbidden || actions.deleteFilterCalls != 0 {
+		t.Fatalf("platform delete status=%d calls=%d", response.Code, actions.deleteFilterCalls)
+	}
+}
+
 func TestSettingsTableKeepsMobileLabels(t *testing.T) {
 	t.Parallel()
 
@@ -307,7 +589,7 @@ func TestUnavailableControlsExplainWhyTheyAreDisabled(t *testing.T) {
 	}{
 		{"/notices/2026-sample-001", []string{"detail-original-note"}},
 		{"/reports", []string{"mail-disabled-note"}},
-		{"/settings", []string{"member-integration-note", "session-note"}},
+		{"/settings", []string{"session-note"}},
 		{"/admin", []string{"admin-integration-note"}},
 	}
 	for _, tt := range tests {
@@ -475,6 +757,20 @@ func TestSaveFilterValidatesCSRFAndCommandBeforeAction(t *testing.T) {
 	}
 }
 
+func TestSaveFilterRejectsZeroDeadlineDays(t *testing.T) {
+	response := serveHandler(t, productionHandler(t, &recordingActions{}), http.MethodPost, "/filters", "_csrf=token-123&name=03&include_keywords=회계&deadline_days=0")
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("zero deadline window accepted: %d", response.Code)
+	}
+}
+
+func TestSaveFilterAcceptsEmptyDeadlineDays(t *testing.T) {
+	response := serveHandler(t, productionHandler(t, &recordingActions{}), http.MethodPost, "/filters", "_csrf=token-123&name=데이터&include_keywords=데이터&deadline_days=")
+	if response.Code != http.StatusSeeOther {
+		t.Fatalf("unlimited deadline rejected: %d", response.Code)
+	}
+}
+
 func TestFilterAllOptionsHaveEmptyValues(t *testing.T) {
 	t.Parallel()
 
@@ -484,12 +780,32 @@ func TestFilterAllOptionsHaveEmptyValues(t *testing.T) {
 	}
 }
 
+func TestDisabledFilterShowsPausedLabelInsteadOfZeroMatches(t *testing.T) {
+	handler, err := NewHandlerWithOptions(Options{
+		Backend: &staticBackend{data: AppData{Filters: []FilterView{{ID: "f1", Name: "데이터", Summary: "ANY: 데이터", Enabled: false}}}},
+		Actions: &recordingActions{},
+		MapContext: func(*http.Request) (RequestContext, error) {
+			return RequestContext{Role: "tenant_admin", TenantID: "tenant-1", CSRFToken: "token-123"}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := serveHandler(t, handler, http.MethodGet, "/filters", "").Body.String()
+	if strings.Contains(body, "현재 공고 0건 일치") {
+		t.Fatal("disabled filter renders a misleading zero count")
+	}
+	if !strings.Contains(body, "사용 안 함") {
+		t.Fatalf("disabled filter is not labelled: %s", body)
+	}
+}
+
 func TestNoticeRegionSearchAcceptsCommaSeparatedFreeText(t *testing.T) {
 	notices := []noticeView{
 		{ID: "busan", Region: "부산광역시"},
 		{ID: "seoul", Region: "서울특별시"},
 	}
-	got := filterNotices(notices, "", "", "경남, 부산")
+	got := filterNotices(notices, "", "", "", "경남, 부산")
 	if len(got) != 1 || got[0].ID != "busan" {
 		t.Fatalf("filtered notices=%+v", got)
 	}
@@ -635,6 +951,15 @@ func TestProductionLoginFormIsEnabledForOuterAuth(t *testing.T) {
 	}
 	if !strings.Contains(body, `type="hidden" name="_csrf" value="token-123"`) {
 		t.Error("production login form missing CSRF field")
+	}
+}
+
+func TestLoginPageAcceptsEmailOrUsername(t *testing.T) {
+	body := serveHandler(t, productionHandler(t, &recordingActions{}), http.MethodGet, "/login", "").Body.String()
+	for _, want := range []string{`<label for="email">이메일 또는 아이디</label>`, `id="email" name="email" type="text"`, `placeholder="이메일 또는 아이디"`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("login form missing %q", want)
+		}
 	}
 }
 
@@ -1006,6 +1331,32 @@ func TestReportDownloadSetsAttachmentSecurityHeadersAndHonorsHEAD(t *testing.T) 
 	}
 }
 
+func TestReportDownloadPreservesKoreanFilename(t *testing.T) {
+	for _, name := range []string{"20260907_데이터보고서.html", "20260907_통합보고서.html", "20260907_" + strings.Repeat("😀", 55) + "보고서.html"} {
+		actions := &recordingActions{downloadName: name, downloadBody: "<html>report</html>"}
+		response := serveHandler(t, productionHandler(t, actions), http.MethodGet, "/reports/"+testReportID+"/download", "")
+		kind, params, err := mime.ParseMediaType(response.Header().Get("Content-Disposition"))
+		if response.Code != http.StatusOK || err != nil || kind != "attachment" || params["filename"] != name {
+			t.Fatalf("status=%d disposition=%q err=%v", response.Code, response.Header().Get("Content-Disposition"), err)
+		}
+	}
+}
+
+func TestReportAttachmentRejectsUnsafeOrMalformedFilenames(t *testing.T) {
+	for _, name := range []string{
+		"", "report.html", "20261307_데이터보고서.html", "20260907_보고서.html",
+		"20260907_../데이터보고서.html", "20260907_..\\데이터보고서.html",
+		"20260907_데이터\r\n보고서.html", "20260907_데이터\x00보고서.html",
+		"20260907_데이터\x7f보고서.html", "20260907_데이터\u0085보고서.html",
+		"20260907_\xff보고서.html", "20260907_데이터:보고서.html",
+		"20260907_" + strings.Repeat("가", 100) + "보고서.html",
+	} {
+		if safeAttachmentName(name) {
+			t.Errorf("accepted unsafe attachment %q", name)
+		}
+	}
+}
+
 func TestReportDownloadHidesMissingIDsAndRejectsUnsafeAttachmentNames(t *testing.T) {
 	t.Parallel()
 
@@ -1083,8 +1434,10 @@ func (b *staticBackend) Load(_ context.Context, _ RequestContext, page PageReque
 type recordingActions struct {
 	saveFilterCalls     int
 	toggleCalls         int
+	deleteFilterCalls   int
 	lastFilter          FilterCommand
 	lastToggle          ToggleFilterCommand
+	lastDeleteFilter    DeleteFilterCommand
 	notificationCalls   int
 	settingsCalls       int
 	lastNotification    NotificationCommand
@@ -1103,8 +1456,44 @@ type recordingActions struct {
 	downloadBody        string
 	downloadModified    time.Time
 	lastDownloadBody    *testReportBody
+	assignCalls         int
+	lastAssign          AssignAccountCommand
+	tenantCalls         int
+	lastTenant          TenantCommand
+	tenantErr           error
+	removeCalls         int
+	lastRemove          AccountCommand
+	deleteCalls         int
+	lastDelete          AccountCommand
 	reportErr           error
 	err                 error
+}
+
+func (a *recordingActions) AssignAccountTenant(_ context.Context, _ RequestContext, command AssignAccountCommand) error {
+	a.assignCalls++
+	a.lastAssign = command
+	return a.err
+}
+
+func (a *recordingActions) RemoveMember(_ context.Context, _ RequestContext, command AccountCommand) error {
+	a.removeCalls++
+	a.lastRemove = command
+	return a.err
+}
+
+func (a *recordingActions) DeleteAccount(_ context.Context, _ RequestContext, command AccountCommand) error {
+	a.deleteCalls++
+	a.lastDelete = command
+	return a.err
+}
+
+func (a *recordingActions) CreateTenant(_ context.Context, _ RequestContext, command TenantCommand) error {
+	a.tenantCalls++
+	a.lastTenant = command
+	if a.tenantErr != nil {
+		return a.tenantErr
+	}
+	return a.err
 }
 
 func (a *recordingActions) SaveFilter(_ context.Context, _ RequestContext, command FilterCommand) error {
@@ -1116,6 +1505,12 @@ func (a *recordingActions) SaveFilter(_ context.Context, _ RequestContext, comma
 func (a *recordingActions) ToggleFilter(_ context.Context, _ RequestContext, command ToggleFilterCommand) error {
 	a.toggleCalls++
 	a.lastToggle = command
+	return a.err
+}
+
+func (a *recordingActions) DeleteFilter(_ context.Context, _ RequestContext, command DeleteFilterCommand) error {
+	a.deleteFilterCalls++
+	a.lastDeleteFilter = command
 	return a.err
 }
 
@@ -1160,6 +1555,11 @@ func (a *recordingActions) GenerateReport(context.Context, RequestContext) error
 
 func (a *recordingActions) RetryReport(_ context.Context, _ RequestContext, reportID string) error {
 	a.retryReportCalls++
+	a.lastReportID = reportID
+	return a.err
+}
+
+func (a *recordingActions) DeleteReport(_ context.Context, _ RequestContext, reportID string) error {
 	a.lastReportID = reportID
 	return a.err
 }

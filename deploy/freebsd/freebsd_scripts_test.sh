@@ -44,6 +44,31 @@ fi
 mock_bin="$test_root/bin"
 mkdir -p "$mock_bin"
 
+# Execute the real prestart function without loading FreeBSD rc.subr or touching
+# system paths. The install boundary records the requested owner and group.
+rc_case="$test_root/rc-owner"
+mkdir -p "$rc_case"
+printf "REPORT_DIR='%s'\n" "$rc_case/reports" > "$rc_case/namo.env"
+sed '/^\. \/etc\/rc.subr$/d; /^run_rc_command /d' "$workspace/deploy/freebsd/namo.in" > "$rc_case/namo.rc"
+(
+	load_rc_config() { :; }
+	install() { printf '%s\n' "$*" >> "$rc_case/install.log"; }
+	namo_run_user=custom_namo
+	namo_run_group=custom_group
+	namo_env_file="$rc_case/namo.env"
+	namo_log_file="$rc_case/namo.log"
+	. "$rc_case/namo.rc"
+	namo_prestart
+)
+if ! grep -Fqx -- "-d -o custom_namo -g custom_group -m 0750 $rc_case/reports" "$rc_case/install.log"; then
+	echo "rc prestart ignored the configured report owner/group" >&2
+	exit 1
+fi
+if ! grep -Fqx -- "-d -o custom_namo -g custom_group -m 0700 /var/db/namo/secrets" "$rc_case/install.log"; then
+	echo "rc prestart did not provision an owner-only API key directory" >&2
+	exit 1
+fi
+
 cat > "$mock_bin/service" <<'EOF'
 #!/bin/sh
 case "$2" in
@@ -111,8 +136,15 @@ run_backup_case()
 {
 	initial=$1
 	result=$2
-	case_dir="$test_root/case-$initial-$result"
+	path_case=${3:-nested}
+	case_dir="$test_root/case-$initial-$result-$path_case"
 	report_dir="$case_dir/custom/reports"
+	expected_tar_base="-C $case_dir/custom reports"
+	if [ "$path_case" = root-child ]; then
+		# /tmp already exists; tar is mocked, so none of its contents are read.
+		report_dir=/tmp
+		expected_tar_base="-C / tmp"
+	fi
 	backup_dir="$case_dir/backups"
 	env_file="$case_dir/namo.env"
 	service_log="$case_dir/service.log"
@@ -153,7 +185,10 @@ run_backup_case()
 		[ -n "$manifest" ]
 		[ "$(wc -l < "$manifest")" -eq 3 ]
 		awk 'NF != 2 || length($1) != 64 { exit 1 }' "$manifest"
-		grep -F -- "-C ${report_dir%/*} ${report_dir##*/}" "$tar_log" >/dev/null
+		if ! grep -F -- "$expected_tar_base" "$tar_log" >/dev/null; then
+			echo "backup used the wrong archive base for $report_dir" >&2
+			exit 1
+		fi
 		globals_final="$(find "$backup_dir" -name 'globals-*.sql' -type f -print -quit)"
 		database_final="$(find "$backup_dir" -name 'namo-*.dump' -type f -print -quit)"
 		reports_final="$(find "$backup_dir" -name 'reports-*.tar' -type f -print -quit)"
@@ -171,6 +206,8 @@ do
 	run_backup_case "$initial" success
 	run_backup_case "$initial" failure
 done
+
+run_backup_case stopped success root-child
 
 symlink_case="$test_root/symlink-case"
 mkdir -p "$symlink_case/real/reports" "$symlink_case/backups"

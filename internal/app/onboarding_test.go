@@ -79,7 +79,7 @@ func TestInvitationServiceCreatesTenantWithHashedFortyEightHourInvitation(t *tes
 	store, mailer := &invitationStoreStub{}, &invitationMailerStub{}
 	service := InvitationService{Store: store, Mailer: mailer, From: "monitor@example.com", BaseURL: "https://monitor.example", Now: func() time.Time { return now }}
 	requestContext := appweb.RequestContext{UserID: "platform-user", Role: "platform_admin"}
-	command := appweb.TenantInviteCommand{TenantName: "샘플 <기업>", ContactEmail: "contact@example.com", AdminName: "김관리", AdminEmail: "Admin@Example.com"}
+	command := TenantInviteInput{TenantName: "샘플 <기업>", ContactEmail: "contact@example.com", AdminName: "김관리", AdminEmail: "Admin@Example.com"}
 
 	result, err := service.InviteTenant(context.Background(), requestContext, command)
 	if err != nil {

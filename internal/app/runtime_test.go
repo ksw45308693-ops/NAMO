@@ -244,6 +244,20 @@ func TestParseCreateAdminReadsPasswordOnlyFromExplicitStdin(t *testing.T) {
 	}
 }
 
+func TestParseCreateAdminAcceptsPlatformUsername(t *testing.T) {
+	options, _, err := parseCreateAdminOptions(
+		[]string{"--email", " Admin ", "--name", "운영자", "--password-stdin"},
+		strings.NewReader("correct horse battery staple\n"),
+		func(string) (io.ReadCloser, error) { return nil, errors.New("must not open a file") },
+	)
+	if err != nil {
+		t.Fatalf("platform username rejected: %v", err)
+	}
+	if options.Email != "admin" {
+		t.Fatalf("platform login = %q, want admin", options.Email)
+	}
+}
+
 func TestParseCreateAdminRequiresExactlyOneSecretSource(t *testing.T) {
 	for _, args := range [][]string{
 		{"--email", "admin@example.com"},

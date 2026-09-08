@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -39,6 +40,43 @@ func (r *PostgresRepository) withTenant(ctx context.Context, tenantID string, fn
 	if r == nil || r.Pool == nil || tenantID == "" || fn == nil {
 		return errors.New("tenant transaction requires a pool, tenant, and operation")
 	}
+	return retryCollectionBusy(ctx, func() error {
+		return r.tenantTransaction(ctx, tenantID, fn)
+	})
+}
+
+// A busy collection lock must release its transaction/connection before waiting:
+// the collector itself needs this pool to finish and release the lock.
+func retryCollectionBusy(ctx context.Context, operation func() error) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := operation(); !errors.Is(err, ErrCollectionRunning) {
+			return err
+		}
+		timer := time.NewTimer(50 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func tryCollectionLock(ctx context.Context, tx digestRowQuerier) error {
+	var locked bool
+	if err := tx.QueryRow(ctx, `SELECT pg_catalog.pg_try_advisory_xact_lock($1)`, collectionAdvisoryLock).Scan(&locked); err != nil {
+		return err
+	}
+	if !locked {
+		return ErrCollectionRunning
+	}
+	return nil
+}
+
+func (r *PostgresRepository) tenantTransaction(ctx context.Context, tenantID string, fn func(pgx.Tx) error) error {
 	tx, err := r.Pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin tenant transaction: %w", err)

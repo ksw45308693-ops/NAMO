@@ -17,6 +17,7 @@ import (
 const (
 	SessionCookieName    = "namo_session"
 	LoginCSRFCookieName  = "namo_login_csrf"
+	SignupCSRFCookieName = "namo_signup_csrf"
 	InviteCSRFCookieName = "namo_invite_csrf"
 	// A fixed default-cost hash keeps unknown-account and invalid-role login
 	// attempts on the same bcrypt path as a normal failed password.
@@ -38,6 +39,7 @@ type SessionRecord struct {
 
 type IdentityRepository interface {
 	AccountByEmail(context.Context, string) (LoginAccount, error)
+	CreateAccount(context.Context, SignupInput) (LoginAccount, error)
 	SaveSession(context.Context, SessionRecord) error
 	SessionByHash(context.Context, string) (SessionRecord, error)
 	DeleteSession(context.Context, string) error
@@ -89,6 +91,18 @@ func (h *authHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.loginPage(w, r)
+		return
+	}
+	if r.URL.Path == "/signup" {
+		switch r.Method {
+		case http.MethodGet, http.MethodHead:
+			h.anonymousPage(w, r, SignupCSRFCookieName, "signup-csrf", "/signup")
+		case http.MethodPost:
+			h.signup(w, r)
+		default:
+			w.Header().Set("Allow", "GET, HEAD, POST")
+			http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
+		}
 		return
 	}
 	if r.URL.Path == "/accept-invite" {
@@ -193,19 +207,73 @@ func (h *authHandler) login(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "요청을 확인할 수 없습니다.", http.StatusForbidden)
 		return
 	}
-	account, err := h.repository.AccountByEmail(r.Context(), strings.TrimSpace(strings.ToLower(r.Form.Get("email"))))
-	accountValid := err == nil && account.Role.Valid()
+	identifier, identifierErr := normalizeLoginIdentifier(r.Form.Get("email"))
+	if identifierErr != nil {
+		identifier = ""
+	}
+	account, err := h.repository.AccountByEmail(r.Context(), identifier)
+	accountValid := identifierErr == nil && err == nil && account.Role.Valid()
 	passwordHash := dummyLoginPasswordHash
 	if accountValid {
 		passwordHash = account.PasswordHash
 	}
 	passwordValid := h.checkPassword(passwordHash, r.Form.Get("password"))
 	if !accountValid || !passwordValid {
-		http.Error(w, "이메일 또는 비밀번호가 올바르지 않습니다.", http.StatusUnauthorized)
+		http.Error(w, "이메일 또는 아이디와 비밀번호가 올바르지 않습니다.", http.StatusUnauthorized)
 		return
 	}
-	now := h.now()
-	session, err := auth.NewSession(account.UserID, now, 12*time.Hour)
+	h.startSession(w, r, account, LoginCSRFCookieName, "/login")
+}
+
+// signup creates a self-service account and starts its session, so a new user
+// reaches the service without a second credential prompt.
+func (h *authHandler) signup(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "가입 정보를 확인해 주세요.", http.StatusBadRequest)
+		return
+	}
+	token, ok := h.anonymousCSRFToken(r, SignupCSRFCookieName, "signup-csrf")
+	if !ok || !constantEqual(r.Form.Get("_csrf"), token) {
+		http.Error(w, "요청을 확인할 수 없습니다.", http.StatusForbidden)
+		return
+	}
+	email, err := normalizeMailbox(r.Form.Get("email"))
+	if err != nil || len([]byte(email)) > 320 {
+		http.Error(w, "이메일 주소를 확인해 주세요.", http.StatusBadRequest)
+		return
+	}
+	password := r.Form.Get("password")
+	if !validSignupPassword(password) {
+		http.Error(w, "비밀번호는 UTF-8 기준 12~72바이트로 입력해 주세요.", http.StatusBadRequest)
+		return
+	}
+	if password != r.Form.Get("password_confirm") {
+		http.Error(w, "비밀번호 확인이 일치하지 않습니다.", http.StatusBadRequest)
+		return
+	}
+	passwordHash, err := auth.HashPassword(password)
+	if err != nil {
+		http.Error(w, "가입을 완료하지 못했습니다.", http.StatusInternalServerError)
+		return
+	}
+	account, err := h.repository.CreateAccount(r.Context(), SignupInput{Email: email, PasswordHash: passwordHash})
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrEmailRegistered):
+			http.Error(w, "이미 등록된 이메일입니다. 로그인 화면을 이용해 주세요.", http.StatusConflict)
+		case errors.Is(err, ErrInvitationWaits):
+			http.Error(w, "이 이메일에는 초대가 진행 중입니다. 초대 메일의 링크로 계정을 만들어 주세요.", http.StatusConflict)
+		default:
+			http.Error(w, "가입을 완료하지 못했습니다.", http.StatusInternalServerError)
+		}
+		return
+	}
+	h.startSession(w, r, account, SignupCSRFCookieName, "/signup")
+}
+
+func (h *authHandler) startSession(w http.ResponseWriter, r *http.Request, account LoginAccount, csrfCookieName, csrfCookiePath string) {
+	session, err := auth.NewSession(account.UserID, h.now(), 12*time.Hour)
 	if err != nil {
 		http.Error(w, "로그인을 시작하지 못했습니다.", http.StatusInternalServerError)
 		return
@@ -224,7 +292,7 @@ func (h *authHandler) login(w http.ResponseWriter, r *http.Request) {
 		MaxAge: int((12 * time.Hour).Seconds()), HttpOnly: true, Secure: h.secure, SameSite: http.SameSiteLaxMode,
 	})
 	http.SetCookie(w, &http.Cookie{
-		Name: LoginCSRFCookieName, Value: "", Path: "/login", MaxAge: -1, Expires: time.Unix(1, 0),
+		Name: csrfCookieName, Value: "", Path: csrfCookiePath, MaxAge: -1, Expires: time.Unix(1, 0),
 		HttpOnly: true, Secure: h.secure, SameSite: http.SameSiteLaxMode,
 	})
 	http.Redirect(w, r, "/dashboard", http.StatusSeeOther)

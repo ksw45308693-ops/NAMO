@@ -229,7 +229,7 @@ func assertReportRuntimePrivileges(t *testing.T, ctx context.Context, runtime *p
 		{"report_items", "SELECT", true},
 		{"report_items", "INSERT", true},
 		{"report_items", "UPDATE", false},
-		{"report_items", "DELETE", false},
+		{"report_items", "DELETE", true},
 	} {
 		var allowed bool
 		if err := runtime.QueryRow(ctx, `SELECT pg_catalog.has_table_privilege(current_user,$1,$2)`, "public."+check.table, check.privilege).Scan(&allowed); err != nil {

@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -45,17 +46,14 @@ func TestDigestSnapshotAdvisoryLockWaitsForCollectorConnection(t *testing.T) {
 	attempted := make(chan struct{})
 	result := make(chan snapshotResult, 1)
 	go func() {
-		tx, err := pool.Begin(ctx)
-		if err != nil {
-			result <- snapshotResult{err: err}
-			return
-		}
-		defer func() { _ = tx.Rollback(ctx) }()
 		close(attempted)
-		cutoff, err := lockDigestSnapshot(ctx, tx)
-		if err == nil {
-			err = tx.Commit(ctx)
-		}
+		var cutoff time.Time
+		repository := &PostgresRepository{Pool: pool}
+		err := repository.withTenant(ctx, "00000000-0000-0000-0000-000000000001", func(tx pgx.Tx) error {
+			var err error
+			cutoff, err = lockDigestSnapshot(ctx, tx)
+			return err
+		})
 		result <- snapshotResult{cutoff: cutoff, err: err}
 	}()
 

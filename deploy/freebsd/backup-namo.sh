@@ -76,7 +76,7 @@ report_dir="$REPORT_DIR"
 test -d "$report_dir"
 
 backup_stamp="$(date -u +%Y%m%dT%H%M%SZ)-$$"
-report_parent="${report_dir%/*}"
+report_parent="$(dirname "$report_dir")"
 report_name="${report_dir##*/}"
 pg_host="/tmp"
 pg_port="5432"

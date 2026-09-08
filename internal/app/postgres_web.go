@@ -17,6 +17,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"namo/internal/auth"
+	"namo/internal/config"
 	"namo/internal/matcher"
 	"namo/internal/model"
 	"namo/internal/report"
@@ -24,6 +26,7 @@ import (
 )
 
 type WebService struct {
+	APIKeys         config.APIKeyStore
 	Repository      *PostgresRepository
 	QueueCollection func() error
 	TestMail        func(context.Context, string) error
@@ -40,7 +43,7 @@ func (s *WebService) MapRequest(r *http.Request) (appweb.RequestContext, error) 
 	requestContext := appweb.RequestContext{CSRFToken: CSRFTokenFromContext(r.Context())}
 	principal, ok := PrincipalFromContext(r.Context())
 	if !ok {
-		if r.URL.Path == "/login" || r.URL.Path == "/accept-invite" {
+		if r.URL.Path == "/login" || r.URL.Path == "/signup" || r.URL.Path == "/accept-invite" {
 			return requestContext, nil
 		}
 		return appweb.RequestContext{}, ErrUnauthenticated
@@ -72,7 +75,7 @@ WHERE u.id=$1::uuid AND u.tenant_id=$2::uuid`, principal.UserID, principal.Tenan
 	return requestContext, err
 }
 
-func (s *WebService) Load(ctx context.Context, requestContext appweb.RequestContext, _ appweb.PageRequest) (appweb.AppData, error) {
+func (s *WebService) Load(ctx context.Context, requestContext appweb.RequestContext, page appweb.PageRequest) (appweb.AppData, error) {
 	if s == nil || s.Repository == nil || s.Repository.Pool == nil {
 		return appweb.AppData{}, errors.New("web repository is not configured")
 	}
@@ -82,7 +85,12 @@ func (s *WebService) Load(ctx context.Context, requestContext appweb.RequestCont
 	}
 	if requestContext.Role == "platform_admin" {
 		data.Admin.ReportDir = s.ReportDir
-		if err := s.loadPlatformData(ctx, &data, state); err != nil {
+		if page.Path == "/settings" {
+			_, keyErr := s.APIKeys.Read()
+			data.Admin.APIKeyConfigured = keyErr == nil
+			data.Admin.APIKeyUnavailable = keyErr != nil && !errors.Is(keyErr, config.ErrAPIKeyNotConfigured)
+		}
+		if err := s.loadPlatformData(ctx, &data, state, requestContext.UserID); err != nil {
 			return appweb.AppData{}, err
 		}
 		return data, nil
@@ -91,9 +99,13 @@ func (s *WebService) Load(ctx context.Context, requestContext appweb.RequestCont
 		return appweb.AppData{}, ErrUnauthenticated
 	}
 	err = s.Repository.withTenant(ctx, requestContext.TenantID, func(tx pgx.Tx) error {
-		return loadTenantWebData(ctx, tx, requestContext.TenantID, &data)
+		return loadTenantWebData(ctx, tx, requestContext.TenantID, &data, noticesNeeded(page.Path))
 	})
 	return data, err
+}
+
+func noticesNeeded(path string) bool {
+	return path == "/notices" || strings.HasPrefix(path, "/notices/") || path == "/filters"
 }
 
 func (s *WebService) loadGlobalState(ctx context.Context) (appweb.AppData, CollectionResult, error) {
@@ -123,7 +135,7 @@ FROM public.collection_state WHERE singleton`).Scan(&lastSuccess, &resultJSON, &
 	return data, result, nil
 }
 
-func loadTenantWebData(ctx context.Context, tx pgx.Tx, tenantID string, data *appweb.AppData) error {
+func loadTenantWebData(ctx context.Context, tx pgx.Tx, tenantID string, data *appweb.AppData, withNotices bool) error {
 	if err := tx.QueryRow(ctx, `SELECT contact_email FROM public.tenants WHERE id=$1::uuid`, tenantID).Scan(&data.ContactEmail); err != nil {
 		return fmt.Errorf("load tenant settings: %w", err)
 	}
@@ -133,11 +145,14 @@ func loadTenantWebData(ctx context.Context, tx pgx.Tx, tenantID string, data *ap
 	if err := loadTenantReports(ctx, tx, tenantID, data); err != nil {
 		return err
 	}
-	if err := loadTenantNotices(ctx, tx, tenantID, data); err != nil {
+	filters, err := loadTenantFilters(ctx, tx, tenantID, data)
+	if err != nil {
 		return err
 	}
-	if err := loadTenantFilters(ctx, tx, tenantID, data); err != nil {
-		return err
+	if withNotices {
+		if err := loadTenantNotices(ctx, tx, data, filters); err != nil {
+			return err
+		}
 	}
 	if err := loadTenantRecipients(ctx, tx, tenantID, data); err != nil {
 		return err
@@ -183,7 +198,7 @@ WHERE tenant_id=$1::uuid AND enabled ORDER BY created_at LIMIT 1`, tenantID).Sca
 
 const tenantReportsSQL = `SELECT id::text,relative_path,trigger,status,due_at,generated_at,notice_count,attempts
 FROM public.reports
-WHERE tenant_id=$1::uuid
+WHERE tenant_id=$1::uuid AND deleted_at IS NULL
 ORDER BY due_at DESC
 LIMIT 50`
 
@@ -235,83 +250,130 @@ func reportViewFromRow(id, relativePath, trigger, status string, dueAt time.Time
 	return view
 }
 
-const tenantNoticesSQL = `SELECT n.id::text, n.payload, m.reasons
-FROM public.matches m
-JOIN public.filters f ON f.tenant_id=m.tenant_id AND f.id=m.filter_id AND f.enabled
-JOIN public.notices n ON n.id=m.notice_id
-WHERE m.tenant_id=$1::uuid ORDER BY m.created_at DESC LIMIT 300`
+const tenantNoticesSQL = `SELECT id::text,payload,collected_at
+FROM public.notices
+WHERE deadline_at IS NULL OR deadline_at >= now()
+ORDER BY published_at DESC NULLS LAST,id`
 
-func loadTenantNotices(ctx context.Context, tx pgx.Tx, tenantID string, data *appweb.AppData) error {
-	rows, err := tx.Query(ctx, tenantNoticesSQL, tenantID)
+type activeWebFilter struct {
+	ID   string
+	Rule matcher.Rule
+}
+
+func loadTenantNotices(ctx context.Context, tx pgx.Tx, data *appweb.AppData, filters []activeWebFilter) error {
+	rows, err := tx.Query(ctx, tenantNoticesSQL)
 	if err != nil {
-		return fmt.Errorf("load matched notices: %w", err)
+		return fmt.Errorf("load notices: %w", err)
 	}
 	defer rows.Close()
-	index := make(map[string]int)
+	now := time.Now()
 	for rows.Next() {
 		var id string
-		var noticeJSON, reasonsJSON []byte
-		if err := rows.Scan(&id, &noticeJSON, &reasonsJSON); err != nil {
-			return fmt.Errorf("scan matched notice: %w", err)
+		var noticeJSON []byte
+		var collectedAt time.Time
+		if err := rows.Scan(&id, &noticeJSON, &collectedAt); err != nil {
+			return fmt.Errorf("scan notice: %w", err)
 		}
-		position, exists := index[id]
-		if !exists {
-			var notice model.Notice
-			if err := json.Unmarshal(noticeJSON, &notice); err != nil {
-				return fmt.Errorf("decode matched notice: %w", err)
-			}
-			view := appweb.NoticeView{
-				ID: id, Title: notice.Title, Category: categoryLabel(notice.Category), Agency: notice.Agency,
-				Region: notice.Region, Amount: formatWon(notice.Amount), Deadline: formatKoreanTime(notice.Deadline), SourceURL: notice.SourceURL,
-			}
-			data.Notices = append(data.Notices, view)
-			position = len(data.Notices) - 1
-			index[id] = position
+		var notice model.Notice
+		if err := json.Unmarshal(noticeJSON, &notice); err != nil {
+			return fmt.Errorf("decode notice: %w", err)
 		}
-		var matched struct {
-			Reasons []matcher.Reason `json:"reasons"`
-			Details []matcher.Detail `json:"details"`
-		}
-		if err := json.Unmarshal(reasonsJSON, &matched); err != nil {
-			return fmt.Errorf("decode match reasons: %w", err)
-		}
-		for _, detail := range matched.Details {
-			data.Notices[position].Reasons = appendUnique(data.Notices[position].Reasons, reasonText(detail))
-		}
-		if len(matched.Details) == 0 {
-			for _, reason := range matched.Reasons {
-				data.Notices[position].Reasons = appendUnique(data.Notices[position].Reasons, reasonText(matcher.Detail{Code: reason}))
-			}
-		}
+		view := noticeViewFromModel(now, id, notice, collectedAt, filters)
+		data.Notices = append(data.Notices, view)
+		applyNoticeFilterCounts(data, view)
 	}
 	return rows.Err()
 }
 
-func loadTenantFilters(ctx context.Context, tx pgx.Tx, tenantID string, data *appweb.AppData) error {
-	rows, err := tx.Query(ctx, `SELECT f.id::text, f.name, f.rules, f.enabled, count(m.id)
-FROM public.filters f LEFT JOIN public.matches m ON m.tenant_id=f.tenant_id AND m.filter_id=f.id
-WHERE f.tenant_id=$1::uuid GROUP BY f.id ORDER BY f.created_at`, tenantID)
+func applyNoticeFilterCounts(data *appweb.AppData, notice appweb.NoticeView) {
+	for i := range data.Filters {
+		if _, matched := notice.FilterReasons[data.Filters[i].ID]; matched {
+			data.Filters[i].Matches++
+		}
+	}
+}
+
+func noticeViewFromModel(now time.Time, id string, notice model.Notice, collectedAt time.Time, filters []activeWebFilter) appweb.NoticeView {
+	view := appweb.NoticeView{
+		ID: id, Title: notice.Title, Category: categoryLabel(notice.Category), Agency: notice.Agency,
+		Region: notice.Region, Amount: formatWon(notice.Amount), Deadline: formatKoreanTime(notice.Deadline), SourceURL: notice.SourceURL,
+		SourceKind: "입찰공고목록-입찰공고", Trade: "-",
+		CollectedDate: formatKoreanDate(collectedAt, "20060102"), CollectedClock: formatKoreanDate(collectedAt, "1504"),
+		PostedAt:      formatKoreanDate(notice.PostedAt, "2006-01-02"),
+		FilterReasons: make(map[string][]string), FilterKeywords: make(map[string]string),
+	}
+	switch notice.Category {
+	case model.CategoryConstruction, model.CategoryService, model.CategoryGoods:
+		view.Trade = "내자"
+	case model.CategoryForeign:
+		view.Trade = "외자"
+	}
+	var keywords []string
+	for _, filter := range filters {
+		matched := matcher.MatchAt(now, notice, filter.Rule)
+		if !matched.Matched {
+			continue
+		}
+		view.FilterReasons[filter.ID] = nil
+		var filterKeywords []string
+		for _, detail := range matched.Details {
+			if detail.Code == matcher.ReasonIncludeAny || detail.Code == matcher.ReasonIncludeAll {
+				keywords = appendUnique(keywords, detail.RuleValue)
+				filterKeywords = appendUnique(filterKeywords, detail.RuleValue)
+			}
+			reason := reasonText(detail)
+			view.Reasons = appendUnique(view.Reasons, reason)
+			view.FilterReasons[filter.ID] = appendUnique(view.FilterReasons[filter.ID], reason)
+		}
+		if len(matched.Details) == 0 {
+			for _, reason := range matched.Reasons {
+				text := reasonText(matcher.Detail{Code: reason})
+				view.Reasons = appendUnique(view.Reasons, text)
+				view.FilterReasons[filter.ID] = appendUnique(view.FilterReasons[filter.ID], text)
+			}
+		}
+		view.FilterKeywords[filter.ID] = strings.Join(filterKeywords, ", ")
+	}
+	view.Keyword = strings.Join(keywords, ", ")
+	return view
+}
+
+func formatKoreanDate(value time.Time, layout string) string {
+	if value.IsZero() {
+		return "-"
+	}
+	return value.In(time.FixedZone("KST", 9*60*60)).Format(layout)
+}
+
+const tenantFiltersSQL = `SELECT id::text, name, rules, enabled
+FROM public.filters
+WHERE tenant_id=$1::uuid ORDER BY created_at`
+
+func loadTenantFilters(ctx context.Context, tx pgx.Tx, tenantID string, data *appweb.AppData) ([]activeWebFilter, error) {
+	rows, err := tx.Query(ctx, tenantFiltersSQL, tenantID)
 	if err != nil {
-		return fmt.Errorf("load filters: %w", err)
+		return nil, fmt.Errorf("load filters: %w", err)
 	}
 	defer rows.Close()
+	var active []activeWebFilter
 	for rows.Next() {
 		var view appweb.FilterView
 		var raw []byte
-		if err := rows.Scan(&view.ID, &view.Name, &raw, &view.Enabled, &view.Matches); err != nil {
-			return err
+		if err := rows.Scan(&view.ID, &view.Name, &raw, &view.Enabled); err != nil {
+			return nil, err
 		}
 		var rule matcher.Rule
 		if err := json.Unmarshal(raw, &rule); err != nil {
-			return fmt.Errorf("decode filter rule: %w", err)
+			return nil, fmt.Errorf("decode filter rule: %w", err)
 		}
 		view.Summary = filterSummary(rule)
 		data.Filters = append(data.Filters, view)
 		if view.Enabled {
 			data.Dashboard.ActiveFilters++
+			active = append(active, activeWebFilter{ID: view.ID, Rule: rule})
 		}
 	}
-	return rows.Err()
+	return active, rows.Err()
 }
 
 func loadTenantRecipients(ctx context.Context, tx pgx.Tx, tenantID string, data *appweb.AppData) error {
@@ -337,7 +399,7 @@ func loadTenantRecipients(ctx context.Context, tx pgx.Tx, tenantID string, data 
 }
 
 func loadTenantMembers(ctx context.Context, tx pgx.Tx, tenantID string, data *appweb.AppData) error {
-	rows, err := tx.Query(ctx, `SELECT display_name, email, role FROM public.users WHERE tenant_id=$1::uuid ORDER BY created_at`, tenantID)
+	rows, err := tx.Query(ctx, `SELECT id::text, display_name, email, role FROM public.users WHERE tenant_id=$1::uuid ORDER BY created_at`, tenantID)
 	if err != nil {
 		return fmt.Errorf("load members: %w", err)
 	}
@@ -345,22 +407,36 @@ func loadTenantMembers(ctx context.Context, tx pgx.Tx, tenantID string, data *ap
 	for rows.Next() {
 		var view appweb.MemberView
 		var role string
-		if err := rows.Scan(&view.Name, &view.Email, &role); err != nil {
+		if err := rows.Scan(&view.UserID, &view.Name, &view.Email, &role); err != nil {
 			return err
 		}
-		view.Role = map[string]string{"tenant_admin": "테넌트 관리자", "member": "담당자"}[role]
+		view.Role = accountRoleLabel(auth.Role(role))
 		data.Members = append(data.Members, view)
 	}
 	return rows.Err()
 }
 
-func (s *WebService) loadPlatformData(ctx context.Context, data *appweb.AppData, _ CollectionResult) error {
+func (s *WebService) loadPlatformData(ctx context.Context, data *appweb.AppData, _ CollectionResult, actorUserID string) error {
 	tenants, err := s.Repository.tenantCatalog(ctx)
 	if err != nil {
 		return err
 	}
+	if err := s.loadAccountAssignments(ctx, data, tenants, actorUserID); err != nil {
+		return err
+	}
+	registry, err := s.Repository.TenantRegistry(ctx, actorUserID)
+	if err != nil {
+		return fmt.Errorf("load tenant registry: %w", err)
+	}
+	contacts := make(map[string]TenantRegistryEntry, len(registry))
+	for _, entry := range registry {
+		contacts[entry.ID] = entry
+	}
 	for _, tenant := range tenants {
 		view := appweb.TenantView{Name: tenant.Name, LastDigest: "생성 전", State: "정상"}
+		if entry, ok := contacts[tenant.ID]; ok {
+			view.AdminName, view.AdminEmail, view.ContactMail = entry.AdminName, entry.AdminEmail, entry.ContactEmail
+		}
 		err := s.Repository.withTenant(ctx, tenant.ID, func(tx pgx.Tx) error {
 			if err := tx.QueryRow(ctx, `SELECT count(*) FROM public.users WHERE tenant_id=$1::uuid`, tenant.ID).Scan(&view.Members); err != nil {
 				return err
@@ -414,17 +490,168 @@ func loadTenantFailureCount(ctx context.Context, queryer failureCountQueryer, te
 	return failures, nil
 }
 
+func (s *WebService) loadAccountAssignments(ctx context.Context, data *appweb.AppData, tenants []tenantCatalogEntry, actorUserID string) error {
+	for _, tenant := range tenants {
+		data.TenantOptions = append(data.TenantOptions, appweb.TenantOption{ID: tenant.ID, Name: tenant.Name})
+	}
+	accounts, err := s.Repository.MemberAccounts(ctx, actorUserID)
+	if err != nil {
+		return fmt.Errorf("load member accounts: %w", err)
+	}
+	for _, account := range accounts {
+		data.Accounts = append(data.Accounts, appweb.AccountView{
+			UserID: account.UserID, Email: account.Email, DisplayName: account.DisplayName,
+			TenantName: account.TenantName, Created: formatKoreanTime(account.Created),
+			Assigned: account.TenantID != "", TenantID: account.TenantID,
+			Role: string(account.Role), RoleLabel: accountRoleLabel(account.Role),
+		})
+	}
+	return nil
+}
+
+// CreateTenant registers one company. Accounts join it through tenant
+// assignment, so no invitation or mail delivery is involved.
+func (s *WebService) CreateTenant(ctx context.Context, requestContext appweb.RequestContext, command appweb.TenantCommand) error {
+	if s == nil || s.Repository == nil {
+		return errors.New("web repository is not configured")
+	}
+	if requestContext.Role != "platform_admin" || requestContext.UserID == "" {
+		return ErrSignupPrivileges
+	}
+	_, err := s.Repository.RegisterTenant(ctx, requestContext.UserID, TenantRegistration{
+		Name: command.Name, ContactEmail: command.ContactEmail,
+		AdminName: command.AdminName, AdminEmail: command.AdminEmail,
+	})
+	if errors.Is(err, ErrTenantRegistered) {
+		return appweb.ErrTenantExists
+	}
+	return err
+}
+
+// AssignAccountTenant grants or removes company access and the role inside the
+// company. The change takes effect on the account's next request because the
+// session lookup reads the assignment live.
+func (s *WebService) AssignAccountTenant(ctx context.Context, requestContext appweb.RequestContext, command appweb.AssignAccountCommand) error {
+	if s == nil || s.Repository == nil {
+		return errors.New("web repository is not configured")
+	}
+	if requestContext.Role != "platform_admin" || requestContext.UserID == "" {
+		return ErrSignupPrivileges
+	}
+	role := auth.Role(command.Role)
+	if command.TenantID == "" {
+		role = auth.Member
+	}
+	err := s.Repository.SetAccountAccess(ctx, requestContext.UserID, command.UserID, command.TenantID, role)
+	if errors.Is(err, ErrAccountRole) {
+		return appweb.ErrAccountRole
+	}
+	return err
+}
+
+// RemoveMember drops one account from the caller's company. The account stays
+// and returns to the unassigned state.
+func (s *WebService) RemoveMember(ctx context.Context, requestContext appweb.RequestContext, command appweb.AccountCommand) error {
+	if s == nil || s.Repository == nil {
+		return errors.New("web repository is not configured")
+	}
+	if requestContext.Role != "tenant_admin" || requestContext.UserID == "" || requestContext.TenantID == "" {
+		return errors.New("company administrator role is required")
+	}
+	return s.Repository.RemoveTenantMember(ctx, requestContext.UserID, requestContext.TenantID, command.UserID)
+}
+
+// DeleteAccount removes the account itself, together with its sessions.
+func (s *WebService) DeleteAccount(ctx context.Context, requestContext appweb.RequestContext, command appweb.AccountCommand) error {
+	if s == nil || s.Repository == nil {
+		return errors.New("web repository is not configured")
+	}
+	if requestContext.Role != "platform_admin" || requestContext.UserID == "" {
+		return ErrSignupPrivileges
+	}
+	return s.Repository.DeleteAccount(ctx, requestContext.UserID, command.UserID)
+}
+
+func accountRoleLabel(role auth.Role) string {
+	if role == auth.TenantAdmin {
+		return "회사 관리자"
+	}
+	return "일반 사용자"
+}
+
 func (s *WebService) SaveFilter(ctx context.Context, requestContext appweb.RequestContext, command appweb.FilterCommand) error {
 	if err := requireTenantAdmin(requestContext); err != nil {
 		return err
 	}
-	raw, err := json.Marshal(filterRuleFromWebCommand(command))
+	rule := filterRuleFromWebCommand(command)
+	raw, err := json.Marshal(rule)
 	if err != nil {
 		return err
 	}
 	return s.Repository.withTenant(ctx, requestContext.TenantID, func(tx pgx.Tx) error {
-		return saveFilter(ctx, tx, requestContext.TenantID, command.Name, raw)
+		if err := tryCollectionLock(ctx, tx); err != nil {
+			return fmt.Errorf("wait for collection before saving filter: %w", err)
+		}
+		now := s.now()
+		notices, err := loadActiveNotices(ctx, tx, now)
+		if err != nil {
+			return err
+		}
+		if err := saveFilter(ctx, tx, requestContext.TenantID, command.Name, raw); err != nil {
+			return err
+		}
+		filter := StoredFilter{TenantID: requestContext.TenantID, Rule: rule}
+		if err := tx.QueryRow(ctx, `SELECT id::text, updated_at FROM public.filters
+WHERE tenant_id=$1::uuid AND name=$2 AND enabled`, requestContext.TenantID, command.Name).Scan(&filter.ID, &filter.Revision); err != nil {
+			return fmt.Errorf("load saved filter revision: %w", err)
+		}
+		return refreshFilterMatches(ctx, tx, now, filter, notices)
 	})
+}
+
+type filterMatchBatcher interface {
+	SendBatch(context.Context, *pgx.Batch) pgx.BatchResults
+}
+
+func refreshFilterMatches(ctx context.Context, tx filterMatchBatcher, now time.Time, filter StoredFilter, notices []ActiveNotice) error {
+	batch := &pgx.Batch{}
+	for _, current := range notices {
+		result := matcher.MatchAt(now, current.Notice, filter.Rule)
+		if !result.Matched {
+			batch.Queue(`WITH eligible_filter AS MATERIALIZED (
+    SELECT id FROM public.filters
+    WHERE tenant_id=$1::uuid AND id=$2::uuid AND enabled AND updated_at=$4
+    FOR UPDATE
+)
+DELETE FROM public.matches m USING eligible_filter f
+WHERE m.tenant_id=$1::uuid AND m.filter_id=f.id AND m.notice_id=$3::uuid`,
+				filter.TenantID, filter.ID, current.ID, filter.Revision)
+			continue
+		}
+		payload, err := json.Marshal(struct {
+			Reasons []matcher.Reason `json:"reasons"`
+			Details []matcher.Detail `json:"details"`
+		}{result.Reasons, result.Details})
+		if err != nil {
+			return fmt.Errorf("encode refreshed filter match: %w", err)
+		}
+		batch.Queue(`WITH eligible_filter AS MATERIALIZED (
+    SELECT id FROM public.filters
+    WHERE tenant_id=$1::uuid AND id=$2::uuid AND enabled AND updated_at=$5
+    FOR UPDATE
+)
+INSERT INTO public.matches (tenant_id, filter_id, notice_id, reasons)
+SELECT $1::uuid, $2::uuid, $3::uuid, $4 FROM eligible_filter
+ON CONFLICT (tenant_id, filter_id, notice_id) DO UPDATE SET reasons=EXCLUDED.reasons`,
+			filter.TenantID, filter.ID, current.ID, payload, filter.Revision)
+	}
+	if batch.Len() == 0 {
+		return nil
+	}
+	if err := tx.SendBatch(ctx, batch).Close(); err != nil {
+		return fmt.Errorf("refresh filter matches: %w", err)
+	}
+	return nil
 }
 
 type webQueryExecer interface {
@@ -479,8 +706,33 @@ func (s *WebService) ToggleFilter(ctx context.Context, requestContext appweb.Req
 	if err := requireTenantAdmin(requestContext); err != nil {
 		return err
 	}
+	var notices []ActiveNotice
+	var err error
+	var now time.Time
 	return s.Repository.withTenant(ctx, requestContext.TenantID, func(tx pgx.Tx) error {
-		return toggleFilter(ctx, tx, requestContext.TenantID, command)
+		if command.Enabled {
+			if err := tryCollectionLock(ctx, tx); err != nil {
+				return fmt.Errorf("wait for collection before enabling filter: %w", err)
+			}
+			now = s.now()
+			notices, err = loadActiveNotices(ctx, tx, now)
+			if err != nil {
+				return err
+			}
+		}
+		if err := toggleFilter(ctx, tx, requestContext.TenantID, command); err != nil || !command.Enabled {
+			return err
+		}
+		filter := StoredFilter{ID: command.FilterID, TenantID: requestContext.TenantID}
+		var raw []byte
+		if err := tx.QueryRow(ctx, `SELECT rules, updated_at FROM public.filters
+WHERE tenant_id=$1::uuid AND id=$2::uuid AND enabled`, requestContext.TenantID, command.FilterID).Scan(&raw, &filter.Revision); err != nil {
+			return fmt.Errorf("load enabled filter revision: %w", err)
+		}
+		if err := json.Unmarshal(raw, &filter.Rule); err != nil {
+			return fmt.Errorf("decode enabled filter rule: %w", err)
+		}
+		return refreshFilterMatches(ctx, tx, now, filter, notices)
 	})
 }
 
@@ -503,6 +755,27 @@ WHERE tenant_id=$1::uuid AND id=$2::uuid`, tenantID, command.FilterID, command.E
 	_, err = tx.Exec(ctx, `DELETE FROM public.matches
 WHERE tenant_id=$1::uuid AND filter_id=$2::uuid`, tenantID, command.FilterID)
 	return err
+}
+
+func (s *WebService) DeleteFilter(ctx context.Context, requestContext appweb.RequestContext, command appweb.DeleteFilterCommand) error {
+	if requestContext.TenantID == "" || requestContext.Role != "tenant_admin" {
+		return errors.New("tenant administrator role is required")
+	}
+	return s.Repository.withTenant(ctx, requestContext.TenantID, func(tx pgx.Tx) error {
+		return deleteFilter(ctx, tx, requestContext.TenantID, command)
+	})
+}
+
+func deleteFilter(ctx context.Context, tx webExecer, tenantID string, command appweb.DeleteFilterCommand) error {
+	tag, err := tx.Exec(ctx, `DELETE FROM public.filters
+WHERE tenant_id=$1::uuid AND id=$2::uuid`, tenantID, command.FilterID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return pgx.ErrNoRows
+	}
+	return nil
 }
 
 func (s *WebService) SaveNotification(ctx context.Context, requestContext appweb.RequestContext, command appweb.NotificationCommand) error {
@@ -613,7 +886,7 @@ func reportDownloadPath(ctx context.Context, queryer reportDownloadQueryer, tena
 	var relativePath string
 	err := queryer.QueryRow(ctx, `SELECT relative_path
 FROM public.reports
-WHERE tenant_id=$1::uuid AND id=$2::uuid AND status='generated' AND relative_path<>''`, tenantID, reportID).Scan(&relativePath)
+WHERE tenant_id=$1::uuid AND id=$2::uuid AND status='generated' AND deleted_at IS NULL AND relative_path<>''`, tenantID, reportID).Scan(&relativePath)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", appweb.ErrReportNotFound
 	}
@@ -690,9 +963,19 @@ func (s *WebService) SaveSettings(ctx context.Context, requestContext appweb.Req
 	})
 }
 
+func (s *WebService) SaveG2BAPIKey(_ context.Context, requestContext appweb.RequestContext, key string) error {
+	if s == nil || requestContext.Role != "platform_admin" || requestContext.UserID == "" {
+		return errors.New("platform administrator identity is required")
+	}
+	return s.APIKeys.Save(key)
+}
+
 func (s *WebService) RunCollection(_ context.Context, requestContext appweb.RequestContext) error {
-	if requestContext.Role != "platform_admin" || s.QueueCollection == nil {
+	if s == nil || requestContext.Role != "platform_admin" || requestContext.UserID == "" || s.QueueCollection == nil {
 		return errors.New("platform collection action is unavailable")
+	}
+	if _, err := s.APIKeys.Read(); err != nil {
+		return err
 	}
 	return s.QueueCollection()
 }
@@ -724,7 +1007,7 @@ func filterRuleFromWebCommand(command appweb.FilterCommand) matcher.Rule {
 		Agencies:           splitTerms(command.Agency),
 		Regions:            splitTerms(command.Region),
 		MinAmount:          command.MinimumAmount,
-		DeadlineWithinDays: &command.DeadlineDays,
+		DeadlineWithinDays: command.DeadlineDays,
 	}
 	terms := splitTerms(command.IncludeKeywords)
 	if command.IncludeMode == "all" {
@@ -835,7 +1118,7 @@ func appendUnique(values []string, value string) []string {
 }
 
 func filterSummary(rule matcher.Rule) string {
-	parts := make([]string, 0, 5)
+	parts := make([]string, 0, 8)
 	if len(rule.IncludeAny) > 0 {
 		parts = append(parts, "ANY: "+strings.Join(rule.IncludeAny, ", "))
 	}
@@ -848,8 +1131,21 @@ func filterSummary(rule matcher.Rule) string {
 	if len(rule.Regions) > 0 {
 		parts = append(parts, strings.Join(rule.Regions, ", "))
 	}
+	if len(rule.Categories) > 0 {
+		labels := make([]string, 0, len(rule.Categories))
+		for _, category := range rule.Categories {
+			labels = append(labels, categoryLabel(category))
+		}
+		parts = append(parts, "업종: "+strings.Join(labels, ", "))
+	}
+	if len(rule.Agencies) > 0 {
+		parts = append(parts, "기관: "+strings.Join(rule.Agencies, ", "))
+	}
 	if rule.MinAmount != nil {
 		parts = append(parts, formatWon(*rule.MinAmount)+" 이상")
+	}
+	if rule.DeadlineWithinDays != nil {
+		parts = append(parts, "마감 "+strconv.Itoa(*rule.DeadlineWithinDays)+"일 이내")
 	}
 	if len(parts) == 0 {
 		return "전체 공고"
