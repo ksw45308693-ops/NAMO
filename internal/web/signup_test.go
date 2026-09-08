@@ -211,15 +211,15 @@ func TestAdminRegistersCompanyWithoutInvitation(t *testing.T) {
 	}
 
 	form := url.Values{
-		"_csrf": {"token-123"}, "tenant_name": {" FM "}, "contact_email": {"ksw@futureman.net"},
-		"admin_name": {"FM"}, "admin_email": {"ksw@futureman.net"},
+		"_csrf": {"token-123"}, "tenant_name": {" FM "}, "contact_email": {"sample@example.com"},
+		"admin_name": {"FM"}, "admin_email": {"sample@example.com"},
 	}
 	created := serveHandler(t, handler, http.MethodPost, "/admin/tenants", form.Encode())
 
 	if created.Code != http.StatusSeeOther || created.Header().Get("Location") != "/admin?result=tenant-created" {
 		t.Fatalf("status=%d location=%q body=%q", created.Code, created.Header().Get("Location"), created.Body.String())
 	}
-	want := TenantCommand{Name: "FM", ContactEmail: "ksw@futureman.net", AdminName: "FM", AdminEmail: "ksw@futureman.net"}
+	want := TenantCommand{Name: "FM", ContactEmail: "sample@example.com", AdminName: "FM", AdminEmail: "sample@example.com"}
 	if actions.lastTenant != want || actions.tenantCalls != 1 {
 		t.Fatalf("tenant command = %+v calls=%d", actions.lastTenant, actions.tenantCalls)
 	}
@@ -228,14 +228,14 @@ func TestAdminRegistersCompanyWithoutInvitation(t *testing.T) {
 func TestCompanyRegistrationRejectsBadInputAndDuplicates(t *testing.T) {
 	admin := RequestContext{UserID: "user-admin", Role: "platform_admin", CSRFToken: "token-123"}
 	valid := url.Values{
-		"_csrf": {"token-123"}, "tenant_name": {"FM"}, "contact_email": {"ksw@futureman.net"},
-		"admin_name": {"FM"}, "admin_email": {"ksw@futureman.net"},
+		"_csrf": {"token-123"}, "tenant_name": {"FM"}, "contact_email": {"sample@example.com"},
+		"admin_name": {"FM"}, "admin_email": {"sample@example.com"},
 	}
 	for name, mutate := range map[string]func(url.Values){
 		"no name":          func(form url.Values) { form.Set("tenant_name", "  ") },
 		"no admin name":    func(form url.Values) { form.Set("admin_name", "") },
-		"bad contact":      func(form url.Values) { form.Set("contact_email", "ksw@@futureman.net") },
-		"named admin mail": func(form url.Values) { form.Set("admin_email", "FM <ksw@futureman.net>") },
+		"bad contact":      func(form url.Values) { form.Set("contact_email", "sample@@example.com") },
+		"named admin mail": func(form url.Values) { form.Set("admin_email", "FM <sample@example.com>") },
 	} {
 		actions := &recordingActions{}
 		handler, _ := signupPageHandler(t, actions, admin)

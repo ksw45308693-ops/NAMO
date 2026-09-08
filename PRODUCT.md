@@ -46,7 +46,7 @@ The first deployment runs on an existing FreeBSD virtual server inside the compa
 
 ## Evidence on Hand
 
-- Visual reference: `C:\Users\CHANGJ~1\AppData\Local\Temp\codex-clipboard-3dbfc563-9b28-43cd-9716-91002d788f72.png`.
+- Visual reference: the user-provided NAMO interface screenshot.
 - Official 나라장터 OpenAPI documentation and a user-approved implementation plan.
 - No customer claims, production metrics, or live API credentials are present in the workspace.
 
